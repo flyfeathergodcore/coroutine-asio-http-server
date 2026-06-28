@@ -1,6 +1,7 @@
 #pragma once
 #include "net/server_base.hpp"
 #include "net/session_pool.hpp"
+#include "net/region_pool.hpp"
 #include <thread>
 #include <vector>
 
@@ -18,6 +19,7 @@ private:
         asio::io_context ioctx;
         std::unique_ptr<tcp::acceptor> acceptor;
         std::unique_ptr<SessionPool> pool;
+        RegionPool region_pool;  // shared backing store for all Session regions
         std::jthread thread;
     };
 

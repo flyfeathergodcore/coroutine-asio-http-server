@@ -1,4 +1,5 @@
 #include "net/session.hpp"
+#include "net/region_pool.hpp"
 #include <iostream>
 #include <sys/sendfile.h>
 #include <unistd.h>
@@ -7,46 +8,49 @@ using asio::ip::tcp;
 
 template<typename Stream>
 Session<Stream>::Session(Stream stream,
-                         std::unique_ptr<Context> parser,
                          RequestHandler& handler,
-                         MiddlewareChain& middleware)
+                         MiddlewareChain& middleware,
+                         RegionPool* region_pool)
     : stream_(std::move(stream))
-    , parser_(std::move(parser))
     , handler_(handler)
-    , middleware_(middleware) {}
+    , middleware_(middleware)
+{
+    if (region_pool)
+        region_.Init(region_pool);
+}
 
 template<typename Stream>
 asio::awaitable<void> Session<Stream>::Start()
 {
-    auto self = this->shared_from_this(); // 保持 Session 存活
+    auto self = this->shared_from_this();
     std::array<char, 4096> buf;
     try {
     for (;;)
     {
-        pool_.Reset();  // 回收上个请求的池内存
+        region_.Reset();  // bump pointer back to 0 (keep region, don't release)
+
+        // Inject region into parser BEFORE Feed (parser stores data in region).
+        parser_.SetPool(&region_);
 
         auto [ec, n] = co_await stream_.async_read_some(
             asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
         if (ec) break;
 
-        {   // 原始字节阶段：中间件可在此短路
+        {   // Raw byte phase: middleware can short-circuit here
             auto mw = middleware_.ProcessRaw(buf.data(), static_cast<size_t>(n));
             if (!mw.IsNone()) { co_await Send(std::move(mw)); break; }
         }
 
-        auto ret = parser_->Feed(buf.data(), static_cast<size_t>(n));
+        auto ret = parser_.Feed(buf.data(), static_cast<size_t>(n));
         if (ret == ParseResult::Incomplete) continue;
-        if (ret == ParseResult::Error) { co_await Send(Response::Error(400)); break; }
+        if (ret == ParseResult::Error) { co_await Send(Response::Error(400, region_)); break; }
 
-        // 注入每个请求的内存池
-        parser_->SetPool(&pool_);
-
-        // 标准洋葱链 → handler
-        auto resp = middleware_.Execute(*parser_, handler_);
+        // Onion chain → handler (handler uses ctx.Pool() to access region)
+        auto resp = middleware_.Execute(parser_, handler_);
         co_await Send(std::move(resp));
 
-        // keep-alive 检查
-        auto conn = parser_->Header("connection");
+        // Keep-alive check
+        auto conn = parser_.Header("connection");
         if (conn == "close") break;
     }
     } catch (std::exception& e) {
@@ -59,9 +63,9 @@ asio::awaitable<void> Session<Stream>::Send(Response response)
 {
     if (response.IsFile())
     {
-        // ── File: 写 Header，然后发送文件体 ──
-        co_await async_write(stream_, asio::buffer(response.Headers()),
-                             asio::use_awaitable);
+        co_await async_write(stream_,
+            asio::buffer(response.HeaderWire()),
+            asio::use_awaitable);
 
         auto fd = response.Fd();
         ::lseek(fd, 0, SEEK_SET);
@@ -69,7 +73,6 @@ asio::awaitable<void> Session<Stream>::Send(Response response)
 
         if constexpr (std::is_same_v<Stream, tcp::socket>)
         {
-            // Plain TCP — 真正的零拷贝 sendfile
             off_t offset = 0;
             while (remaining > 0) {
                 ssize_t n = ::sendfile(stream_.native_handle(), fd,
@@ -83,7 +86,6 @@ asio::awaitable<void> Session<Stream>::Send(Response response)
         }
         else
         {
-            // SSL — read + async_write
             std::array<char, 65536> readbuf;
             while (remaining > 0) {
                 auto to_read = std::min(remaining, readbuf.size());
@@ -96,20 +98,24 @@ asio::awaitable<void> Session<Stream>::Send(Response response)
             }
         }
     }
-    else if (!response.Body().empty())
-    {
-        // ── String: 单次 gather-write 发送 headers + body（一个 SSL 记录） ──
-        std::array<asio::const_buffer, 2> bufs = {{
-            asio::buffer(response.Headers()),
-            asio::buffer(response.Body())
-        }};
-        co_await async_write(stream_, bufs, asio::use_awaitable);
-    }
     else
     {
-        // ── Raw: 只有 headers（已包含完整响应） ──
-        co_await async_write(stream_, asio::buffer(response.Headers()),
-                             asio::use_awaitable);
+        auto body = response.BodyWire();
+        if (!body.empty())
+        {
+            // Single gather-write: headers + body in one SSL record
+            std::array<asio::const_buffer, 2> bufs = {{
+                asio::buffer(response.HeaderWire()),
+                asio::buffer(body)
+            }};
+            co_await async_write(stream_, bufs, asio::use_awaitable);
+        }
+        else
+        {
+            co_await async_write(stream_,
+                asio::buffer(response.HeaderWire()),
+                asio::use_awaitable);
+        }
     }
 }
 

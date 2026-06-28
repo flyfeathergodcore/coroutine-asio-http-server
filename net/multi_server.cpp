@@ -1,6 +1,5 @@
 #include "net/multi_server.hpp"
 #include "net/session.hpp"
-#include "http/llhttp_parser.hpp"
 #include <iostream>
 #include <memory>
 #include <sys/socket.h>
@@ -32,7 +31,6 @@ void MultiServer::Start()
     {
         auto w = std::make_unique<Worker>();
 
-        // Create acceptor on this worker's io_context
         w->acceptor = std::make_unique<tcp::acceptor>(w->ioctx);
         w->acceptor->open(endpoint_.protocol());
         EnableReusePort(*w->acceptor);
@@ -51,7 +49,6 @@ void MultiServer::Start()
         workers_.push_back(std::move(w));
     }
 
-    // Block main thread until all workers finish
     for (auto& w : workers_) {
         w->thread.join();
     }
@@ -75,19 +72,21 @@ asio::awaitable<void> MultiServer::Listen(Worker& worker)
                 asio::as_tuple(asio::use_awaitable));
             if (ec) continue;
 
-            // 从池取 Session 或新建
+            // Acquire Session (from pool or new)
             auto session = worker.pool->TryAcquireSession();
             if (session) {
-                session->Reset(std::move(ss),
-                               std::make_unique<LlhttpParser>());
+                session->Reset(std::move(ss));
+                // region_ is already attached to worker.region_pool
+                // from the constructor — just ensure it's ready.
+                session->Region().Init(&worker.region_pool);
             } else {
                 session = std::make_shared<
                     Session<asio::ssl::stream<tcp::socket>>>(
-                    std::move(ss), std::make_unique<LlhttpParser>(),
-                    handler_, middleware_);
+                    std::move(ss),
+                    handler_, middleware_, &worker.region_pool);
             }
 
-            // Lambda 捕获 Session，结束后归还
+            // Spawn request loop, return session to pool when done
             asio::co_spawn(exec,
                 [session = std::move(session), pool = worker.pool.get()]()
                     -> asio::awaitable<void> {

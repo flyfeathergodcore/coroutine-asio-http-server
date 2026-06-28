@@ -1,6 +1,5 @@
 #include "net/server.hpp"
 #include "net/session.hpp"
-#include "http/llhttp_parser.hpp"
 #include <iostream>
 #include <memory>
 
@@ -39,7 +38,7 @@ asio::awaitable<void> Server::Listen()
 
             auto session = std::make_shared<
                 Session<asio::ssl::stream<tcp::socket>>>(
-                std::move(ss), std::make_unique<LlhttpParser>(),
+                std::move(ss),
                 handler_, middleware_);
 
             asio::co_spawn(exec, session->Start(), asio::detached);

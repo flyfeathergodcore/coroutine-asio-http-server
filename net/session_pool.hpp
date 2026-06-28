@@ -2,7 +2,6 @@
 #include "net/session.hpp"
 #include "http/llhttp_parser.hpp"
 #include <memory>
-#include <mutex>
 #include <vector>
 
 // ── Session 对象池 ──
@@ -26,7 +25,6 @@ public:
     size_t IdleCount() const;
 
 private:
-    mutable std::mutex mtx_;
     std::vector<
         std::shared_ptr<Session<asio::ssl::stream<asio::ip::tcp::socket>>>>
         idle_;

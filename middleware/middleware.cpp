@@ -91,9 +91,8 @@ Response CORSMiddleware::Handle(const Context& ctx,
         return r;
     }
 
-    auto response = next.Handle(ctx);
-    response.AddHeader("Access-Control-Allow-Origin: *");
-    return response;
+    ctx.AddResponseHeader("Access-Control-Allow-Origin", "*");
+    return next.Handle(ctx);
 }
 
 // ── Http2DetectMiddleware ──

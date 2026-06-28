@@ -4,6 +4,8 @@
 
 enum class ParseResult { Incomplete = 0, Complete = 1, Error = -1 };
 
+class SessionRegion;   // forward decl
+
 class Context {
 public:
     virtual ~Context() = default;
@@ -18,10 +20,36 @@ public:
     virtual std::string_view Header(const std::string_view key) const = 0;
     virtual std::string_view Body()   const = 0;
 
-    // Per-request memory pool (optional, set by Session before Execute).
-    class MemPool* Pool() const { return pool_; }
-    void SetPool(class MemPool* p) const { pool_ = p; }
+    // Per-request memory pool (set by Session before Feed).
+    SessionRegion* Pool() const { return pool_; }
+    void SetPool(SessionRegion* p) const { pool_ = p; }
+
+    // ── Response header injection (middleware → handler) ──
+    //
+    // Middleware calls AddResponseHeader() before next.Handle().
+    // Handler reads injected headers via ResponseHeaders() and
+    // writes them to the region.  Cleared at the start of each Feed().
+    //
+    static constexpr int kMaxExtraHeaders = 8;
+
+    void AddResponseHeader(std::string_view key,
+                           std::string_view value) const {
+        if (extra_header_count_ >= kMaxExtraHeaders) return;
+        extra_header_keys_[extra_header_count_] = key;
+        extra_header_vals_[extra_header_count_] = value;
+        extra_header_count_++;
+    }
+    int ResponseHeaderCount() const { return extra_header_count_; }
+    std::string_view ResponseHeaderKey(int i) const { return extra_header_keys_[i]; }
+    std::string_view ResponseHeaderVal(int i) const { return extra_header_vals_[i]; }
+    void ClearResponseHeaders() const {
+        extra_header_count_ = 0;
+    }
 
 private:
-    mutable class MemPool* pool_ = nullptr;
+    mutable SessionRegion* pool_ = nullptr;
+
+    mutable int extra_header_count_ = 0;
+    mutable std::string_view extra_header_keys_[kMaxExtraHeaders];
+    mutable std::string_view extra_header_vals_[kMaxExtraHeaders];
 };

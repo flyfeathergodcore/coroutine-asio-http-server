@@ -52,7 +52,8 @@ add_executable(http_server
     net/multi_server.cpp
     net/session.cpp
     net/response.cpp
-    net/mem_pool.cpp
+    net/region_pool.cpp
+    net/session_region.cpp
     net/tls_context.cpp
     http/httpparser.cpp
     http/llhttp_parser.cpp

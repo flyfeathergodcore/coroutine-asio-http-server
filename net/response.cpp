@@ -1,102 +1,120 @@
 #include "net/response.hpp"
-#include "net/mem_pool.hpp"
-#include "http/response.hpp"
-#include "http/fixed_buffer.hpp"
-#include <unistd.h>
+#include "net/session_region.hpp"
+#include <cstdio>
 
-// ── String-body response (heap-backed) ──
+// ── Region-backed response ──
 
-Response::Response(int code, std::string mime, std::string body)
-    : valid_(true)
-    , body_own_(std::move(body))
-    , mime_(std::move(mime))
+Response::Response(int code, SessionRegion& region)
+    : region_(&region)
+    , begin_off_(region.Used())
     , code_(code)
 {
-    FixedBuffer buf;
-    http::BuildHeaderTo(buf, code_, mime_, body_own_.size());
-    headers_.assign(buf.Data(), buf.Size());
+    // Write status line directly to region
+    region_->Write("HTTP/1.1 ");
+    switch (code) {
+        case 200: region_->Write("200 OK"); break;
+        case 204: region_->Write("204 No Content"); break;
+        case 400: region_->Write("400 Bad Request"); break;
+        case 403: region_->Write("403 Forbidden"); break;
+        case 404: region_->Write("404 Not Found"); break;
+        case 426: region_->Write("426 Upgrade Required"); break;
+        case 501: region_->Write("501 Not Implemented"); break;
+        default:  region_->Write("500 Internal Server Error"); break;
+    }
+    region_->WriteCRLF();
 }
 
-// ── Error response ──
-
-Response Response::Error(int code)
-{
-    std::string_view text =
-        (code == 400) ? "Bad Request" :
-        (code == 403) ? "Forbidden" :
-        (code == 404) ? "Not Found" :
-        (code == 501) ? "Not Implemented" :
-                        "Error";
-    std::string body = "<h1>" + std::to_string(code) + " "
-                       + std::string(text) + "</h1>";
-    return Response(code, "text/html", std::move(body));
-}
-
-// ── File-body response ──
-
-Response Response::File(int code, std::string mime,
-                         int fd, size_t file_size)
-{
-    Response r;
-    r.valid_ = true;
-    r.code_ = code;
-    r.fd_ = fd;
-    r.file_size_ = file_size;
-    r.mime_ = std::move(mime);
-    FixedBuffer buf;
-    http::BuildHeaderTo(buf, r.code_, r.mime_, file_size);
-    r.headers_.assign(buf.Data(), buf.Size());
-    return r;
-}
-
-// ── Raw wire-format response ──
+// ── Raw (pre-built wire, no region) ──
 
 Response Response::Raw(int code, std::string wire)
 {
     Response r;
-    r.valid_ = true;
     r.code_ = code;
-    r.headers_ = std::move(wire);
+    r.raw_wire_ = std::move(wire);
+    r.raw_mode_ = true;
     return r;
 }
 
-// ── Pool-allocated response ──
+// ── Header building ──
 
-Response Response::Pooled(MemPool& pool, int code,
-                           std::string_view mime, std::string_view body)
-{
-    Response r;
-    r.valid_ = true;
-    r.code_ = code;
-    r.pool_ = &pool;
-
-    // Headers from pool
-    FixedBuffer buf;
-    http::BuildHeaderTo(buf, code, mime, body.size());
-    auto hdr = pool.Dup(buf.View());
-    r.headers_.assign(hdr.data(), hdr.size());
-
-    // Body from pool
-    r.body_pool_ = pool.Dup(body);
-
-    return r;
+void Response::Header(std::string_view key, std::string_view value) {
+    region_->Write(key);
+    region_->Write(": ");
+    region_->Write(value);
+    region_->WriteCRLF();
 }
 
-// ── Body accessor ──
-
-std::string_view Response::Body() const
-{
-    if (pool_)
-        return body_pool_;
-    return body_own_;
+void Response::Header(std::string_view key, uint64_t value) {
+    region_->Write(key);
+    region_->Write(": ");
+    region_->WriteUint(value);
+    region_->WriteCRLF();
 }
 
-// ── AddHeader ──
+void Response::EndHeaders() {
+    region_->WriteCRLF();
+    header_end_ = region_->Used();
+}
 
-void Response::AddHeader(const std::string& line)
+// ── Body ──
+
+void Response::Body(const char* data, size_t len) {
+    ext_body_ = data;
+    ext_body_len_ = len;
+}
+
+void Response::BodyFile(int fd, size_t file_size) {
+    fd_ = fd;
+    file_size_ = file_size;
+}
+
+// ── Queries ──
+
+bool Response::IsNone() const {
+    return !region_ && !raw_mode_;
+}
+
+bool Response::IsFile() const {
+    return region_ && fd_ >= 0;
+}
+
+std::string_view Response::HeaderWire() const {
+    if (raw_mode_) return raw_wire_;
+    if (region_)
+        return {region_->Data() + begin_off_, header_end_ - begin_off_};
+    return {};
+}
+
+std::string_view Response::BodyWire() const {
+    if (ext_body_)     // external body (FileCache, not in region)
+        return {ext_body_, ext_body_len_};
+    if (region_ && header_end_ > 0 && region_->Used() > header_end_)
+        return {region_->Data() + header_end_, region_->Used() - header_end_};
+    return {};
+}
+
+// ── Error factory ──
+
+Response Response::Error(int code, SessionRegion& region)
 {
-    auto pos = headers_.find("\r\n\r\n");
-    if (pos != std::string::npos) {
-        headers_.insert(pos + 2, line + "\r\n");
+    const char* text;
+    switch (code) {
+        case 400: text = "Bad Request"; break;
+        case 403: text = "Forbidden"; break;
+        case 404: text = "Not Found"; break;
+        case 501: text = "Not Implemented"; break;
+        default:  text = "Error"; break;
     }
+
+    char body[128];
+    int body_len = std::snprintf(body, sizeof(body),
+                                 "<h1>%d %s</h1>", code, text);
+    if (body_len < 0) body_len = 0;
+
+    Response resp(code, region);
+    resp.Header("Content-Type", "text/html");
+    resp.Header("Content-Length", static_cast<uint64_t>(body_len));
+    resp.EndHeaders();
+    region.Write({body, static_cast<size_t>(body_len)});
+    return resp;
 }
