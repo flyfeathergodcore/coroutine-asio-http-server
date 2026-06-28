@@ -9,6 +9,7 @@ struct Config {
     std::string doc_root = "./www";
     std::string tls_cert;                // PEM certificate path
     std::string tls_key;                 // PEM private key path
+    bool cpu_affinity = true;            // pin worker threads to dedicated cores
 
     static Config Load(const std::string& path);
 };

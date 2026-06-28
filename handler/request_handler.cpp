@@ -2,6 +2,27 @@
 #include "net/response.hpp"
 #include "net/session_region.hpp"
 #include <unistd.h>
+#include <cstdio>
+#include <ctime>
+
+// ── Helpers for HTTP-date format (RFC 7231) and ETag ──
+
+static std::string FormatTime(time_t t)
+{
+    char buf[64];
+    struct tm tm;
+    ::gmtime_r(&t, &tm);
+    ::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    return buf;
+}
+
+static std::string FormatEtag(time_t mtime, size_t size)
+{
+    char buf[48];
+    int n = std::snprintf(buf, sizeof(buf), "\"%lx-%zx\"",
+                          static_cast<unsigned long>(mtime), size);
+    return std::string(buf, static_cast<size_t>(n));
+}
 
 StaticFileHandler::StaticFileHandler(const FileCache* cache)
     : cache_(cache) {}
@@ -29,6 +50,9 @@ Response StaticFileHandler::Handle(const Context& ctx)
         Response resp(200, *pool);
         resp.Header("Content-Type", file->mime);
         resp.Header("Content-Length", file->content.size());
+        resp.Header("Last-Modified", FormatTime(file->mtime));
+        resp.Header("ETag", FormatEtag(file->mtime, file->content.size()));
+        resp.Header("Accept-Ranges", "bytes");
         // Inject any headers from middleware (CORS etc.)
         for (int i = 0; i < ctx.ResponseHeaderCount(); i++)
             resp.Header(ctx.ResponseHeaderKey(i), ctx.ResponseHeaderVal(i));
@@ -42,6 +66,9 @@ Response StaticFileHandler::Handle(const Context& ctx)
         Response resp(200, *pool);
         resp.Header("Content-Type", file->mime);
         resp.Header("Content-Length", file->file_size);
+        resp.Header("Last-Modified", FormatTime(file->mtime));
+        resp.Header("ETag", FormatEtag(file->mtime, file->file_size));
+        resp.Header("Accept-Ranges", "bytes");
         for (int i = 0; i < ctx.ResponseHeaderCount(); i++)
             resp.Header(ctx.ResponseHeaderKey(i), ctx.ResponseHeaderVal(i));
         resp.EndHeaders();

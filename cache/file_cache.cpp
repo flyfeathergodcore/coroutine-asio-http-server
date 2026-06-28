@@ -40,6 +40,12 @@ void FileCache::LoadDirectory(const std::string& doc_root)
 
         auto file_size = static_cast<size_t>(entry.file_size());
 
+        // Stat for mtime
+        struct stat st;
+        time_t mtime = 0;
+        if (::stat(path.c_str(), &st) == 0)
+            mtime = st.st_mtime;
+
         // Open fd for sendfile (always keep open)
         int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -63,7 +69,8 @@ void FileCache::LoadDirectory(const std::string& doc_root)
             std::move(content),
             DetectMime(path),
             fd,
-            file_size
+            file_size,
+            mtime
         };
         total += file_size;
         count++;

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <sys/socket.h>
+#include <pthread.h>
 
 MultiServer::MultiServer(const Config& cfg,
                          RequestHandler& handler,
@@ -51,7 +52,18 @@ void MultiServer::Start()
         // Per-worker metrics flush timer
         asio::co_spawn(w->ioctx, FlushLoop(i), asio::detached);
 
-        w->thread = std::jthread([w = w.get()] {
+        w->thread = std::jthread([w = w.get(), cpu_id = i,
+                                   affinity = cfg_.cpu_affinity] {
+            if (affinity) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(cpu_id, &cpuset);
+                int rc = ::pthread_setaffinity_np(::pthread_self(),
+                                                   sizeof(cpuset), &cpuset);
+                if (rc != 0 && cpu_id == 0)
+                    std::cerr << "[server] 警告: pthread_setaffinity_np 失败 ("
+                              << rc << "), 跳过 CPU 亲和性" << std::endl;
+            }
             w->ioctx.run();
         });
 
@@ -79,34 +91,39 @@ asio::awaitable<void> MultiServer::Listen(Worker& worker)
             auto socket = co_await worker.acceptor->async_accept(
                 asio::use_awaitable);
 
-            asio::ssl::stream<tcp::socket> ss(std::move(socket),
-                                              tls_->NativeContext());
-
-            auto [ec] = co_await ss.async_handshake(
-                asio::ssl::stream_base::server,
-                asio::as_tuple(asio::use_awaitable));
-            if (ec) continue;
-
-            // Acquire Session (from pool or new)
-            auto session = worker.pool->TryAcquireSession();
-            if (session) {
-                session->Reset(std::move(ss));
-                session->Region().Init(&worker.region_pool);
-                session->SetMetrics(metrics_.get(), this_id);
-            } else {
-                session = std::make_shared<
-                    Session<asio::ssl::stream<tcp::socket>>>(
-                    std::move(ss),
-                    handler_, middleware_, &worker.region_pool);
-                session->SetMetrics(metrics_.get(), this_id);
-            }
-
-            // Spawn request loop, return session to pool when done
+            // Spawn handshake + session handling immediately in a detached
+            // coroutine so the accept loop stays hot — no more serialising
+            // TLS handshake inside the accept loop.
+            //
+            // Before: accept → handshake (blocking next accept) → spawn session
+            // After:  accept → spawn(handshake+session) → accept (immediate)
             asio::co_spawn(exec,
-                [session = std::move(session), pool = worker.pool.get()]()
-                    -> asio::awaitable<void> {
+                [this, socket = std::move(socket), &worker, this_id]() mutable
+                    -> asio::awaitable<void>
+                {
+                    asio::ssl::stream<tcp::socket> ss(
+                        std::move(socket), tls_->NativeContext());
+
+                    auto [ec] = co_await ss.async_handshake(
+                        asio::ssl::stream_base::server,
+                        asio::as_tuple(asio::use_awaitable));
+                    if (ec) co_return;
+
+                    auto session = worker.pool->TryAcquireSession();
+                    if (session) {
+                        session->Reset(std::move(ss));
+                        session->Region().Init(&worker.region_pool);
+                        session->SetMetrics(metrics_.get(), this_id);
+                    } else {
+                        session = std::make_shared<
+                            Session<asio::ssl::stream<tcp::socket>>>(
+                            std::move(ss),
+                            handler_, middleware_, &worker.region_pool);
+                        session->SetMetrics(metrics_.get(), this_id);
+                    }
+
                     co_await session->Start();
-                    pool->ReleaseSession(std::move(session));
+                    worker.pool->ReleaseSession(std::move(session));
                 },
                 asio::detached);
         }

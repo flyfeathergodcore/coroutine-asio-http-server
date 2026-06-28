@@ -1,6 +1,8 @@
 #include "net/response.hpp"
 #include "net/session_region.hpp"
 #include <cstdio>
+#include <cstring>
+#include <ctime>
 
 // ── Region-backed response ──
 
@@ -52,7 +54,33 @@ void Response::Header(std::string_view key, uint64_t value) {
     region_->WriteCRLF();
 }
 
+// ── Cached HTTP-date formatter (updated once per second) ──
+
+static std::string_view CachedDate()
+{
+    static time_t last = 0;
+    static char buf[64];
+    auto now = ::time(nullptr);
+    if (now != last) {
+        last = now;
+        struct tm tm;
+        ::gmtime_r(&now, &tm);
+        ::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    }
+    return {buf, strlen(buf)};
+}
+
 void Response::EndHeaders() {
+    if (region_) {
+        // RFC 7231 §7.1.1.2 — Date is mandatory for all responses
+        auto date = CachedDate();
+        region_->Write("Date: ");
+        region_->Write(date);
+        region_->WriteCRLF();
+        // HTTP/1.1 default is keep-alive, but be explicit
+        if (!sse_)
+            region_->Write("Connection: keep-alive\r\n");
+    }
     region_->WriteCRLF();
     header_end_ = region_->Used();
 }
@@ -99,11 +127,10 @@ std::string_view Response::BodyWire() const {
 Response Response::SSEStream(SessionRegion& region, int min_interval_ms)
 {
     Response resp(200, region);
+    resp.sse_ = true;  // before EndHeaders so Date/Connection handled correctly
     resp.Header("Content-Type", "text/event-stream");
     resp.Header("Cache-Control", "no-cache");
-    resp.Header("Connection", "keep-alive");
     resp.EndHeaders();
-    resp.sse_ = true;
     resp.push_interval_ms_ = std::max(min_interval_ms, 200);  // floor 200ms
     return resp;
 }

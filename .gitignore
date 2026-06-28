@@ -29,3 +29,4 @@ logs/
 
 # SSL 证书
 ybuestc.art_nginx/
+benchmark.*

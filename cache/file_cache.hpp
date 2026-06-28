@@ -10,6 +10,7 @@ struct CachedFile {
     std::string mime;      // MIME type
     int fd = -1;           // file descriptor for sendfile
     size_t file_size = 0;  // actual file size on disk
+    time_t mtime = 0;      // modification time (for Last-Modified / ETag)
 };
 
 class FileCache {
