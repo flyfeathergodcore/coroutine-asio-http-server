@@ -34,6 +34,9 @@ public:
                  : std::pair<std::string_view, std::string_view>{};
     }
 
+    /// Content-Length from the request headers.
+    size_t ContentLength() const { return content_length_; }
+
     // ── Response body source (for nghttp2 DATA frames) ──
     const char* resp_body_ = nullptr;
     size_t resp_body_len_ = 0;
@@ -44,6 +47,9 @@ public:
     bool sse_active_ = false;
     int  push_interval_ms_ = 1000;
     std::string sse_payload_;
+
+    // ── Body size tracking ──
+    size_t content_length_ = 0;
 
     // ── State ──
     bool handled_ = false;       // true when HandleStream has been spawned

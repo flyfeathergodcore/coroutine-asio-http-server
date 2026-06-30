@@ -15,6 +15,7 @@ Response::Response(int code, SessionRegion& region)
     switch (code) {
         case 200: region_->Write("200 OK"); break;
         case 204: region_->Write("204 No Content"); break;
+        case 304: region_->Write("304 Not Modified"); break;
         case 301: region_->Write("301 Moved Permanently"); break;
         case 400: region_->Write("400 Bad Request"); break;
         case 403: region_->Write("403 Forbidden"); break;

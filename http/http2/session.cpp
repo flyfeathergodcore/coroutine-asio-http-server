@@ -410,6 +410,14 @@ asio::awaitable<void> H2Session::HandleStream(int32_t stream_id)
     ctx.SetPool(&region_);
     region_.SetStructuredMode(true);
 
+    // ── Body size check ──
+    if (max_body_size_ > 0 && ctx.ContentLength() > max_body_size_) {
+        nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE,
+                                   stream_id, NGHTTP2_REFUSED_STREAM);
+        streams_.erase(stream_id);
+        co_return;
+    }
+
     auto start_time = std::chrono::steady_clock::now();
     bool ok = false;
     try

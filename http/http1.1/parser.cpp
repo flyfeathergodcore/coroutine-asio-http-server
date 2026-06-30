@@ -119,7 +119,7 @@ bool H1Parser::ProcessLine()
 
     if (state_ == HEADERS)
     {
-        if (line_len_ == 0)
+        if (line_buf_[0] == '\0')
         {
             auto* pool = Pool();
             if (content_length_ > 0 && pool)

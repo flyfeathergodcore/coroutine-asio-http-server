@@ -21,6 +21,15 @@ void H2StreamContext::AddHeader(std::string_view name, std::string_view value)
     headers_[header_count_].name  = pool->DupOff(name);
     headers_[header_count_].value = pool->DupOff(value);
     header_count_++;
+
+    // Track Content-Length for body size limiting
+    if (name == "content-length") {
+        content_length_ = 0;
+        for (char c : value) {
+            if (c < '0' || c > '9') break;
+            content_length_ = content_length_ * 10 + static_cast<size_t>(c - '0');
+        }
+    }
 }
 
 void H2StreamContext::AppendBody(const uint8_t* data, size_t len)

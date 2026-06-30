@@ -16,6 +16,7 @@ Config Config::Load(const std::string& path)
         if (srv["threads"])    cfg.threads  = srv["threads"].as<int>();
         if (srv["doc_root"])     cfg.doc_root     = srv["doc_root"].as<std::string>();
         if (srv["cpu_affinity"]) cfg.cpu_affinity = srv["cpu_affinity"].as<bool>();
+        if (srv["max_body_size"]) cfg.max_body_size = srv["max_body_size"].as<size_t>();
 
         auto tls = srv["tls"];
         if (tls) {

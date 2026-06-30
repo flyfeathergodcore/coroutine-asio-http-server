@@ -32,6 +32,9 @@ public:
         worker_id_ = wid;
     }
 
+    /// Set maximum request body size (0 = unlimited).
+    void SetMaxBodySize(size_t bytes) { max_body_size_ = bytes; }
+
 protected:
     SessionBase(Router& router,
                 MiddlewareManager& middleware)
@@ -44,4 +47,5 @@ protected:
     MiddlewareManager& middleware_;
     MetricsCollector* metrics_ = nullptr;
     int worker_id_ = -1;
+    size_t max_body_size_ = 0;   // 0 = unlimited
 };

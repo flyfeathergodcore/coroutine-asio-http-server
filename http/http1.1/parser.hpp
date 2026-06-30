@@ -28,6 +28,9 @@ public:
     /// True if the connection starts with HTTP/2 preface ("PRI * HTTP/2.0").
     bool IsH2() const { return h2_detected_; }
 
+    /// Content-Length of the request body (0 if not set).
+    size_t ContentLength() const { return content_length_; }
+
 private:
     enum State : uint8_t {
         REQUEST_LINE,

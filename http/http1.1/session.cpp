@@ -88,6 +88,25 @@ asio::awaitable<void> H11Session<Stream>::Start()
             break;
         }
 
+        // ── Body size check ──
+        if (max_body_size_ > 0 && parser_.ContentLength() > max_body_size_) {
+            {
+                auto resp = Response::Raw(413,
+                    "HTTP/1.1 413 Payload Too Large\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 21\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "Payload Too Large\r\n");
+                int code = resp.StatusCode();
+                size_t bytes = resp.HeaderWire().size() + resp.BodyWire().size();
+                co_await Send(std::move(resp));
+                co_await middleware_.ExecutePost(parser_, code, bytes,
+                    dur_us(read_start), worker_id_);
+            }
+            break;
+        }
+
         // ── PreRequest phase (sync) ──
         {
             auto pre = middleware_.ExecutePre(parser_);

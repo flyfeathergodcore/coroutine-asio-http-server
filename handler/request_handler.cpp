@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
 
 // ── Helpers for HTTP-date format (RFC 7231) and ETag ──
 
@@ -45,6 +46,38 @@ Response StaticFileHandler::Handle(const Context& ctx)
         return Response::Error(404, *pool);
     }
 
+    // ── Conditional request (304 Not Modified) ──
+    {
+        bool not_modified = false;
+        auto if_none_match = ctx.Header("if-none-match");
+        if (!if_none_match.empty()) {
+            auto etag_str = FormatEtag(file->mtime,
+                !file->content.empty() ? file->content.size() : file->file_size);
+            if (if_none_match == etag_str)
+                not_modified = true;
+        }
+        if (!not_modified) {
+            auto ims = ctx.Header("if-modified-since");
+            if (!ims.empty()) {
+                struct tm tm;
+                if (::strptime(ims.data(), "%a, %d %b %Y %H:%M:%S GMT", &tm)) {
+                    time_t ims_time = ::timegm(&tm);
+                    if (ims_time >= file->mtime)
+                        not_modified = true;
+                }
+            }
+        }
+        if (not_modified) {
+            Response resp(304, *pool);
+            resp.Header("Cache-Control", "no-cache");
+            for (int i = 0; i < ctx.ResponseHeaderCount(); i++)
+                resp.Header(ctx.ResponseHeaderKey(i), ctx.ResponseHeaderVal(i));
+            resp.EndHeaders();
+            return resp;
+        }
+    }
+
+    // ── Normal response ──
     // In-memory content available → gather-write (faster for SSL)
     if (!file->content.empty()) {
         Response resp(200, *pool);
