@@ -45,7 +45,19 @@ public:
                                               int worker_id) {
         co_return;
     }
+
+    // ── PostResponse 钩子（同步） ──
+    // 用于不需要挂起的 post middleware，避免协程帧的分配开销。
+    // HandlePost 如果不需要 co_await，应该重写此方法而非 HandlePost。
+    // MiddlewareManager::ExecutePostSync 会调用此方法。
+    virtual void HandlePostSync(const Context& /*ctx*/,
+                                 int /*status_code*/,
+                                 size_t /*bytes_sent*/,
+                                 uint64_t /*elapsed_us*/,
+                                 int /*worker_id*/) {}
 };
+
+// ── MiddlewareManager ──
 
 // ── MiddlewareManager ──
 //
@@ -75,6 +87,15 @@ public:
                                        size_t bytes_sent,
                                        uint64_t elapsed_us,
                                        int worker_id);
+
+    /// 串行运行所有 PostResponse 中间件（同步）。
+    /// 调用 HandlePostSync，零协程帧开销。
+    /// 如果所有 post middleware 都不需要挂起，用此方法替代 ExecutePost。
+    void ExecutePostSync(const Context& ctx,
+                          int status_code,
+                          size_t bytes_sent,
+                          uint64_t elapsed_us,
+                          int worker_id);
 
 private:
     std::vector<std::unique_ptr<Middleware>> owned_;  // 拥有所有对象
@@ -114,6 +135,11 @@ public:
                                       size_t bytes_sent,
                                       uint64_t elapsed_us,
                                       int worker_id) override;
+    void HandlePostSync(const Context& ctx,
+                         int status_code,
+                         size_t bytes_sent,
+                         uint64_t elapsed_us,
+                         int worker_id) override;
 };
 
 class MetricsCollector;
@@ -132,6 +158,11 @@ public:
                                       size_t bytes_sent,
                                       uint64_t elapsed_us,
                                       int worker_id) override;
+    void HandlePostSync(const Context& ctx,
+                         int status_code,
+                         size_t bytes_sent,
+                         uint64_t elapsed_us,
+                         int worker_id) override;
 
     /// 由 session 在启动时设置 worker ID。
     void SetWorkerId(int wid) { worker_id_ = wid; }

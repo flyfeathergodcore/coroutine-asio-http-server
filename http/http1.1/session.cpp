@@ -55,7 +55,7 @@ asio::awaitable<void> H11Session<Stream>::Start()
                 int code = mw.StatusCode();
                 size_t bytes = mw.HeaderWire().size() + mw.BodyWire().size();
                 co_await WriteError(std::move(mw));
-                co_await middleware_.ExecutePost(parser_, code, bytes,
+                middleware_.ExecutePostSync(parser_, code, bytes,
                     dur_us(read_start), worker_id_);
                 break;
             }
@@ -68,13 +68,13 @@ asio::awaitable<void> H11Session<Stream>::Start()
         if (ret == ParseResult::Error) {
             int code = parser_.IsH2() ? 426 : 400;
             co_await WriteError(code);
-            co_await middleware_.ExecutePost(parser_, code, 0,
+            middleware_.ExecutePostSync(parser_, code, 0,
                 dur_us(read_start), worker_id_);
             break;
         }
         if (max_body_size_ > 0 && parser_.ContentLength() > max_body_size_) {
             co_await WriteError(413);
-            co_await middleware_.ExecutePost(parser_, 413, 0,
+            middleware_.ExecutePostSync(parser_, 413, 0,
                 dur_us(read_start), worker_id_);
             break;
         }
@@ -88,7 +88,7 @@ asio::awaitable<void> H11Session<Stream>::Start()
                 bool is_stream = pre.IsStream();
                 co_await Send(std::move(pre));
                 if (is_stream) break;
-                co_await middleware_.ExecutePost(parser_, code, bytes,
+                middleware_.ExecutePostSync(parser_, code, bytes,
                     dur_us(read_start), worker_id_);
 
                 auto conn = parser_.Header("connection");
@@ -127,7 +127,7 @@ asio::awaitable<void> H11Session<Stream>::Start()
         if (is_stream) break;
 
         // ── PostResponse phase ──
-        co_await middleware_.ExecutePost(parser_, code, bytes,
+        middleware_.ExecutePostSync(parser_, code, bytes,
             dur_us(read_start), worker_id_);
 
         auto conn = parser_.Header("connection");

@@ -58,6 +58,15 @@ asio::awaitable<void> MiddlewareManager::ExecutePost(
     }
 }
 
+void MiddlewareManager::ExecutePostSync(
+    const Context& ctx, int status_code,
+    size_t bytes_sent, uint64_t elapsed_us, int worker_id)
+{
+    for (auto* mw : post_) {
+        mw->HandlePostSync(ctx, status_code, bytes_sent, elapsed_us, worker_id);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // CORSMiddleware
 // ═══════════════════════════════════════════════════════════════
@@ -136,7 +145,7 @@ static std::string_view LogTimestamp(SessionRegion& pool)
     return pool.ToView(off);
 }
 
-asio::awaitable<void> LoggingMiddleware::HandlePost(
+void LoggingMiddleware::HandlePostSync(
     const Context& ctx,
     int status_code,
     size_t bytes_sent,
@@ -145,7 +154,7 @@ asio::awaitable<void> LoggingMiddleware::HandlePost(
 {
     auto* pool = const_cast<Context&>(ctx).Pool();
     if (!pool)
-        co_return;
+        return;
 
     // Build JSON line — thread_local buffer, no per-request alloc
     thread_local std::string j;
@@ -179,6 +188,16 @@ asio::awaitable<void> LoggingMiddleware::HandlePost(
     j += '"';
     j += '}';
     FastLogger::Instance().Log(std::move(j));
+}
+
+asio::awaitable<void> LoggingMiddleware::HandlePost(
+    const Context& ctx,
+    int status_code,
+    size_t bytes_sent,
+    uint64_t elapsed_us,
+    int worker_id)
+{
+    HandlePostSync(ctx, status_code, bytes_sent, elapsed_us, worker_id);
     co_return;
 }
 
@@ -231,7 +250,7 @@ Response MetricsMiddleware::HandlePre(Context& ctx)
     return Response::None();
 }
 
-asio::awaitable<void> MetricsMiddleware::HandlePost(
+void MetricsMiddleware::HandlePostSync(
     const Context& ctx,
     int status_code,
     size_t bytes_sent,
@@ -241,5 +260,15 @@ asio::awaitable<void> MetricsMiddleware::HandlePost(
     if (collector_)
         collector_->OnRequest(elapsed_us, status_code, bytes_sent, worker_id,
                                ctx.IsHttp2());
+}
+
+asio::awaitable<void> MetricsMiddleware::HandlePost(
+    const Context& ctx,
+    int status_code,
+    size_t bytes_sent,
+    uint64_t elapsed_us,
+    int worker_id)
+{
+    HandlePostSync(ctx, status_code, bytes_sent, elapsed_us, worker_id);
     co_return;
 }

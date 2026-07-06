@@ -893,8 +893,8 @@ asio::awaitable<void> H2Session::HandleStream(int32_t stream_id)
             auto end = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                end - start_time).count();
-            co_await middleware_.ExecutePost(ctx, resp.StatusCode(),
-                                             body_len, elapsed, worker_id_);
+            middleware_.ExecutePostSync(ctx, resp.StatusCode(),
+                                        body_len, elapsed, worker_id_);
         }
         ok = true;
     }
