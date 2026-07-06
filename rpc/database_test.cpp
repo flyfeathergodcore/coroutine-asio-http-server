@@ -41,8 +41,11 @@ int main()
 {
     try {
         asio::io_context ioc;
-        asio::co_spawn(ioc, Test(ioc), asio::detached);
-        asio::executor_work_guard<asio::io_context::executor_type> wg(ioc.get_executor());
+        auto wg = asio::make_work_guard(ioc.get_executor());
+        asio::co_spawn(ioc, Test(ioc), [&](std::exception_ptr e) {
+            wg.reset();
+            if (e) std::rethrow_exception(e);
+        });
         ioc.run();
     } catch (std::exception& e) {
         std::cerr << "错误: " << e.what() << std::endl;
