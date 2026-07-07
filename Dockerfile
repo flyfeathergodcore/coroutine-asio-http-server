@@ -16,7 +16,7 @@ RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
 # ═══════════════════════════════════════════
 FROM alpine:3.21
 
-RUN apk add --no-cache libstdc++ libgcc openssl yaml-cpp sqlite3-libs
+RUN apk add --no-cache libstdc++ libgcc openssl yaml-cpp sqlite-libs
 
 COPY --from=build /src/build/http_server /app/
 COPY www /app/www
