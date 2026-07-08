@@ -33,25 +33,21 @@
 
 ---
 
-### 3. 多架构 Docker 构建 - `docker-multiarch.yml`
-**触发条件：** Push、PR、Tag 推送
+### 3. Docker 镜像构建（已合并至 CI）
+**触发条件：** Push 到 main 分支
 
 **功能：**
-- 构建 AMD64 和 ARM64 架构镜像
-- **生产环境：** AMD64/x64 平台
-- **测试环境：** ARM64（本地 Docker 测试）
+- 构建 AMD64 架构镜像
 - 自动推送到 GHCR
 - 使用 GitHub Actions Cache 加速构建
 - 支持语义化版本标签
 
 **架构说明：**
-- 主架构：AMD64（生产部署）
-- 测试架构：ARM64（本地开发测试）
+- **生产架构：** AMD64/x64 专用优化
 
 **镜像标签规则：**
-- `main` 分支 → `latest`
+- `main` 分支 → `latest` + `<commit-sha>`
 - `v1.2.3` tag → `v1.2.3`, `v1.2`, `v1`, `latest`
-- PR → `pr-123`
 
 ---
 
