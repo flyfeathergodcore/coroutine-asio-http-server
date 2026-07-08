@@ -84,18 +84,14 @@ jobs:
           generate_release_notes: false
 
   build-and-push-release:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: create-release
 
     steps:
       - uses: actions/checkout@v4
 
       - name: 登录到 GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
       - name: 提取版本号
         id: version
@@ -103,34 +99,24 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: 提取 Docker 元数据
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
-
       - name: 构建并推送发布镜像
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VCS_REF=${{ github.sha }}
-
-      - name: 镜像摘要
-        run: echo ${{ steps.meta.outputs.digest }}
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f1-2)
+          docker build \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:${MINOR}" \
+            -t "${IMAGE}:${MAJOR}" \
+            -t "${IMAGE}:latest" \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg VCS_REF="${{ github.sha }}" \
+            .
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:${MINOR}"
+          docker push "${IMAGE}:${MAJOR}"
+          docker push "${IMAGE}:latest"
 
   deploy-production:
     runs-on: self-hosted
