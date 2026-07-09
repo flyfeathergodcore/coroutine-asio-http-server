@@ -34,6 +34,7 @@ jobs:
             libasio-dev libssl-dev libsqlite3-dev \
             libyaml-cpp-dev libnghttp2-dev liburing-dev \
             libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            nlohmann-json3-dev libmysqlclient-dev \
             cmake g++ git
 
       - name: 安装 agrpc (asio-grpc)
@@ -115,6 +116,7 @@ jobs:
             libasio-dev libssl-dev libsqlite3-dev \
             libyaml-cpp-dev libnghttp2-dev liburing-dev \
             libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            nlohmann-json3-dev libmysqlclient-dev \
             cmake g++ git
 
       - name: 安装 agrpc (asio-grpc)

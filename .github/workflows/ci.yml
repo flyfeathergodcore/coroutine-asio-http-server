@@ -98,50 +98,12 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 登录到 GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-
-      - name: 构建并推送 Docker 镜像
-        run: |
-          # webcpp 主镜像
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          docker build -t "${IMAGE}:latest" -t "${IMAGE}:${{ github.sha }}" .
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${{ github.sha }}"
-          # ai-chat 镜像
-          AI_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ai-chat"
-          docker build -t "${AI_IMAGE}:latest" -t "${AI_IMAGE}:${{ github.sha }}" \
-            -f examples/python_services/ai-chat/Dockerfile examples/
-          docker push "${AI_IMAGE}:latest"
-          docker push "${AI_IMAGE}:${{ github.sha }}"
-
       - name: 部署到腾讯云
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          AI_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ai-chat"
-
-          cd /home/ubuntu/webcpp
-
-          # 更新 docker-compose.yml 和配置
-          cp ${{ github.workspace }}/docker-compose.yml .
-          cp ${{ github.workspace }}/config.yaml .
-
-          # 拉取最新镜像
-          docker pull ${IMAGE}:latest
-          docker pull ${AI_IMAGE}:latest
-          docker pull mysql:8.0
-          docker pull ollama/ollama:latest
-
-          # 同步前端文件
-          rsync -a ${{ github.workspace }}/www/ www/
-
           # 首次部署创建 SSL 证书
           if [ ! -f ybuestc.art_nginx/ybuestc.art_bundle.crt ]; then
             mkdir -p ybuestc.art_nginx
@@ -151,9 +113,9 @@ jobs:
               -days 365 -nodes -subj "/CN=localhost"
           fi
 
-          # 启动（--wait 等待所有健康检查通过再返回）
+          # 构建并启动所有服务
           docker compose down --remove-orphans
-          docker compose up -d --wait
+          docker compose up --build -d
 
           echo '=== 服务状态 ==='
           docker compose ps

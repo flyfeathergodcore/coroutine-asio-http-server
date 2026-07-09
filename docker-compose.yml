@@ -14,7 +14,9 @@ services:
 
   # ── AI Chat 微服务 ──
   ai-chat:
-    image: ghcr.io/flyfeathergodcore/ybserver-ai-chat:latest
+    build:
+      context: ./examples
+      dockerfile: python_services/ai-chat/Dockerfile
     expose: ["50051"]
     environment:
       - LLM_MODEL=ollama/qwen2.5:0.5b
@@ -35,7 +37,7 @@ services:
 
   # ── HTTP 网关 ──
   webcpp:
-    image: ghcr.io/flyfeathergodcore/ybserver:latest
+    build: .
     ports:
       - "443:8443"
     volumes:
@@ -66,10 +68,11 @@ services:
       MYSQL_PASSWORD: webcpp123
     networks: [app-net]
     healthcheck:
-      test: ["CMD-SHELL", "mysql -uroot -proot123 -e 'SELECT 1' 2>/dev/null || exit 1"]
-      interval: 5s
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -proot123 --silent || mysql -uroot -proot123 -e 'SELECT 1'"]
+      interval: 10s
       timeout: 10s
-      retries: 20
+      retries: 30
+      start_period: 40s
     restart: unless-stopped
 
 volumes:
