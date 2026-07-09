@@ -14,9 +14,7 @@ services:
 
   # ── AI Chat 微服务 ──
   ai-chat:
-    build:
-      context: examples
-      dockerfile: python_services/ai-chat/Dockerfile
+    image: ghcr.io/flyfeathergodcore/ybserver-ai-chat:latest
     expose: ["50051"]
     environment:
       - LLM_MODEL=ollama/qwen2.5:0.5b
@@ -37,7 +35,7 @@ services:
 
   # ── HTTP 网关 ──
   webcpp:
-    build: .
+    image: ghcr.io/flyfeathergodcore/ybserver:latest
     ports:
       - "443:8443"
     volumes:
