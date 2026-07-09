@@ -34,4 +34,4 @@ heaptrack_results/
 valgrind_results/
 static-analysis-reports
 docs/
-tools
+toolsstatic-analysis-reports-2/
