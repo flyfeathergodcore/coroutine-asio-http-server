@@ -103,10 +103,10 @@ services:
       MYSQL_PASSWORD: webcpp123
     networks: [ai-net]
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-proot123"]
+      test: ["CMD-SHELL", "mysql -uroot -proot123 -e 'SELECT 1' 2>/dev/null || exit 1"]
       interval: 5s
-      timeout: 5s
-      retries: 15
+      timeout: 10s
+      retries: 20
 
 volumes:
   ollama_data:
