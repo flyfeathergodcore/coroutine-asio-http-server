@@ -114,8 +114,8 @@ jobs:
           fi
 
           # 构建并启动所有服务
-          docker compose down --remove-orphans
-          docker compose up --build -d
+          docker compose -f examples/docker-compose.dev.yml down --remove-orphans
+          docker compose -f examples/docker-compose.dev.yml up --build -d
 
           echo '=== 服务状态 ==='
-          docker compose ps
+          docker compose -f examples/docker-compose.dev.yml ps

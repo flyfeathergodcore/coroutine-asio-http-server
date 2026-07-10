@@ -1,7 +1,9 @@
-# ── 本地开发环境 ──
+# ── 本地开发 / 生产部署 通用环境 ──
 # 使用 Ollama 运行本地小模型（qwen2.5:0.5b, ~400MB）
-# 启动：docker compose -f docker-compose.dev.yml up
+# 本地启动：docker compose -f docker-compose.dev.yml up
+# 生产部署：docker compose -f docker-compose.dev.yml up --build -d
 # 首次启动自动拉取模型（需要等待约 1 分钟）
+# 注意：本地开发如需修改端口，在 compose 同目录创建 docker-compose.override.yml
 
 services:
 
@@ -19,6 +21,7 @@ services:
       - https_proxy=
       - NO_PROXY=*
       - no_proxy=*
+    restart: unless-stopped
     # GPU 支持（有 NVIDIA GPU 时取消注释）
     # deploy:
     #   resources:
@@ -69,8 +72,13 @@ services:
       - MYSQL_DATABASE=webcpp
       - NO_PROXY=ollama,ai-chat,webcpp,mysql,localhost,127.0.0.1
       - no_proxy=ollama,ai-chat,webcpp,mysql,localhost,127.0.0.1
-    depends_on: [ollama-pull, mysql]
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
     networks: [ai-net]
+    restart: unless-stopped
 
   # ── HTTP 服务器 ──
   webcpp:
@@ -78,16 +86,25 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "8443:8443"
+      - "443:8443"
     volumes:
       - ../config.yaml:/app/config.yaml
       - ../ybuestc.art_nginx:/app/ybuestc.art_nginx
       - ../www:/app/www
-    depends_on: [ai-chat]
+    depends_on:
+      ai-chat:
+        condition: service_started
+      mysql:
+        condition: service_healthy
     networks: [ai-net]
     environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_USER=webcpp
+      - MYSQL_PASSWORD=webcpp123
+      - MYSQL_DATABASE=webcpp
       - NO_PROXY=ollama,ai-chat,webcpp,mysql,localhost,127.0.0.1,172.18.0.0/16
       - no_proxy=ollama,ai-chat,webcpp,mysql,localhost,127.0.0.1,172.18.0.0/16
+    restart: unless-stopped
 
   # ── MySQL 数据库 ──
   mysql:
@@ -103,10 +120,12 @@ services:
       MYSQL_PASSWORD: webcpp123
     networks: [ai-net]
     healthcheck:
-      test: ["CMD-SHELL", "mysql -uroot -proot123 -e 'SELECT 1' 2>/dev/null || exit 1"]
-      interval: 5s
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -proot123 --silent || mysql -uroot -proot123 -e 'SELECT 1'"]
+      interval: 10s
       timeout: 10s
-      retries: 20
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
 
 volumes:
   ollama_data:
