@@ -167,6 +167,14 @@ class ProductAgent:
             {"type": "rank", "rank_id": 200006, "sort_type": 2, "limit": 10},
         ])
 
+        # ── 新增实例变量（product_main_loop 循环状态）──
+        self._product_history: list[dict] = []
+        self._current_intent: dict = {}
+        self._current_candidates: list[dict] = []
+        self._current_analysis: Any = None  # ProductAnalysis，用于 recommend 工具
+        self._product_chat_prompt = self._load_file(os.path.join(
+            self._config_dir, "prompts", "product_chat.txt"))
+
     # ================================================================
     # System Prompt 构建 — 拼接所有 skill .md 文档
     # ================================================================
@@ -795,3 +803,244 @@ class ProductAgent:
         }
 
         return comparison
+
+    # ================================================================
+    # 新增: Product Main Loop — LLM 产品对话循环
+    # ================================================================
+
+    def product_main_loop(
+        self,
+        session_id: str,
+        first_call: bool = False,
+        user_message: str = "",
+        history: list[dict] | None = None,
+    ) -> dict:
+        """
+        产品 Agent 主循环 — 自主搜索/推荐/答疑/对比
+
+        Args:
+            session_id: 会话 ID，用于从 MCP 恢复状态
+            first_call: True=首次调用，从 MCP 读 intent 并搜索
+            user_message: 后续调用的用户消息
+            history: 产品阶段的对话历史（优先于 self._product_history）
+
+        Returns:
+            {"reply": str, "candidates": list[dict]}
+        """
+        if history is not None:
+            self._product_history = history
+
+        if first_call:
+            # 首次调用：从 MCP 读 intent → 搜索
+            self._current_intent = self._load_intent_from_mcp(session_id)
+            if not self._current_intent:
+                return {"reply": "导购信息不完整，请重新描述需求", "candidates": []}
+
+            self._current_analysis = self.search_by_guide_intent(self._current_intent)
+            self._current_candidates = (self._current_analysis.candidates or [])[:10]
+
+            if not self._current_candidates:
+                return {"reply": "未找到符合需求的产品，请调整需求", "candidates": []}
+
+            # LLM 生成首次回复
+            reply = self._product_llm_first_response()
+            self._product_history.append({"role": "agent", "content": reply})
+        else:
+            # 后续调用：LLM 工具循环
+            self._product_history.append({"role": "user", "content": user_message})
+            reply = self._product_llm_with_tools()
+            self._product_history.append({"role": "agent", "content": reply})
+
+        # 自动保存状态
+        self._save_product_session(session_id)
+
+        return {"reply": reply, "candidates": self._current_candidates}
+
+    def _load_intent_from_mcp(self, session_id: str) -> dict:
+        """从 MCP 读取导购 agent 存储的 session_intent"""
+        result = self._call_mcp("query_memory_by_type",
+            mem_type="session_intent", limit=10)
+        if not result:
+            return {}
+
+        nodes = result.get("profiles", result.get("nodes", []))
+        if isinstance(result, list):
+            nodes = result
+
+        # 按 session_id 过滤
+        for node in nodes:
+            if isinstance(node, dict):
+                content = node.get("content", "")
+                tags = node.get("tags", "")
+                if session_id in tags:
+                    try:
+                        return json.loads(content) if isinstance(content, str) else content
+                    except json.JSONDecodeError:
+                        return content
+        # 如果 sessions_id 不匹配，取最新的
+        for node in nodes:
+            if isinstance(node, dict):
+                content = node.get("content", "")
+                try:
+                    return json.loads(content) if isinstance(content, str) else content
+                except json.JSONDecodeError:
+                    return content
+        return {}
+
+    def _product_llm_first_response(self) -> str:
+        """基于搜索结果生成首次回复"""
+        candidates = self._current_candidates
+        intent = self._current_intent
+
+        # 获取 MCP 工具列表
+        mcp_tools = ""
+        if self._mcp:
+            try:
+                tools = self._mcp.skill_list()
+                mcp_tools = json.dumps([{"name": t["name"], "params": t.get("params", {})} for t in tools],
+                                        ensure_ascii=False, indent=2)
+            except Exception:
+                mcp_tools = "（MCP 工具列表不可用）"
+
+        prompt = self._product_chat_prompt.format(
+            candidates=json.dumps(candidates[:3], ensure_ascii=False, indent=2)[:2000],
+            intent=json.dumps(intent, ensure_ascii=False, indent=2),
+            mcp_tools=mcp_tools,
+        )
+
+        return self.llm.chat(prompt, system_prompt="你是京东产品推荐助手。", temperature=0.3)
+
+    def _product_llm_with_tools(self, max_iterations: int = 3) -> str:
+        """产品 Agent LLM 工具循环 — 处理 search/detail/compare/recommend"""
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+
+            # 获取 MCP 工具列表
+            mcp_tools = ""
+            if self._mcp:
+                try:
+                    tools = self._mcp.skill_list()
+                    mcp_tools = json.dumps([{"name": t["name"], "params": t.get("params", {})} for t in tools[:10]],
+                                            ensure_ascii=False, indent=2)
+                except Exception:
+                    mcp_tools = "（MCP 工具列表不可用）"
+
+            # 构建 prompt
+            history_text = "\n".join(
+                f"[{d['role']}]: {d['content'][:500]}" for d in self._product_history[-10:]
+            )
+            candidates_text = json.dumps(self._current_candidates[:3], ensure_ascii=False, indent=2)[:2000]
+
+            prompt = self._product_chat_prompt.format(
+                candidates=candidates_text,
+                intent=json.dumps(self._current_intent, ensure_ascii=False, indent=2),
+                mcp_tools=mcp_tools,
+            )
+            prompt += f"\n\n## 当前对话\n{history_text}\n\n## 请根据对话和结果生成回复或调用工具"
+
+            raw = self.llm.chat(prompt, system_prompt="你是京东产品推荐助手。", temperature=0.3)
+
+            # 解析 action
+            action = self._parse_product_action(raw)
+            if action is None:
+                return raw.strip()  # 纯文本回复
+
+            action_type = action.get("type")
+            kwargs = action.get("kwargs", {})
+
+            if action_type == "search":
+                keyword = kwargs.get("keyword", "")
+                brand = kwargs.get("brand", "")
+                price_min = kwargs.get("price_min", 0)
+                price_max = kwargs.get("price_max", 99999)
+                constraints = kwargs.get("constraints", [])
+
+                # 更新 intent
+                if keyword:
+                    self._current_intent["category"] = keyword
+                self._current_intent["intent_delta"] = self._current_intent.get("intent_delta", {})
+                if brand:
+                    self._current_intent["intent_delta"]["brand"] = brand
+                if price_min or price_max:
+                    self._current_intent["intent_delta"]["budget"] = {
+                        "min": price_min, "max": price_max,
+                        "current": price_max, "confidence": "medium",
+                    }
+                if brand:
+                    self._current_intent["intent_delta"]["constraints"] = constraints
+
+                # 重新搜索
+                self._current_analysis = self.search_by_guide_intent(self._current_intent)
+                self._current_candidates = (self._current_analysis.candidates or [])[:10]
+
+                tool_output = f"搜索到 {len(self._current_candidates)} 款产品"
+                self._product_history.append({"role": "tool", "content": tool_output})
+
+            elif action_type == "detail":
+                product_id = kwargs.get("product_id", "")
+                if product_id:
+                    detail = self.answer_product_question(
+                        f"介绍一下产品 {product_id}",
+                        candidates=self._current_candidates,
+                    )
+                    self._product_history.append({"role": "tool", "content": detail[:1000]})
+
+            elif action_type == "compare":
+                pids = kwargs.get("product_ids", [])
+                if pids:
+                    result = self.compare_products(pids)
+                    self._product_history.append({
+                        "role": "tool",
+                        "content": json.dumps(result, ensure_ascii=False)[:1000],
+                    })
+
+            elif action_type == "recommend":
+                # 生成推荐评分
+                intent_info = {"session_intent": self._current_intent, "user_profile": {}}
+                recs = self.generate_recommendations(
+                    self._current_analysis, intent_info) if self._current_analysis else []
+                self._product_history.append({
+                    "role": "tool",
+                    "content": json.dumps([{"score": r.score, "reasons": r.reasons} for r in recs], ensure_ascii=False)[:1000],
+                })
+
+        return "请问还有什么可以帮你的？"
+
+    @staticmethod
+    def _parse_product_action(raw: str) -> dict | None:
+        """
+        解析 product agent LLM 的 action 输出。
+        格式与 guide agent 相同: [json]:{"tool":true,"tool_name":"...","kwargs":{...}}
+
+        返回:
+            {"type": "search"|"detail"|"compare"|"recommend", "kwargs": {...}} | None
+        """
+        if not raw:
+            return None
+
+        # 复用 json_parse 的 JSON 提取
+        from tools.json_parse import _extract_json_from_text
+        result = _extract_json_from_text(raw)
+
+        if result and result.get("tool") is True:
+            tool_name = result.get("tool_name", "")
+            kwargs = result.get("kwargs", {})
+            return {"type": tool_name, "kwargs": kwargs}
+
+        return None
+
+    def _save_product_session(self, session_id: str):
+        """保存当前产品阶段状态到 MCP"""
+        state = {
+            "stage": "product",
+            "intent": self._current_intent,
+            "candidates": self._current_candidates[:10],
+            "history": self._product_history[-30:],
+        }
+        self._call_mcp("store_memory",
+            node_type="product_session",
+            content=json.dumps(state, ensure_ascii=False),
+            importance=0.8,
+            tags=f"session:{session_id}",
+        )
