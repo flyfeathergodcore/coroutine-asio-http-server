@@ -290,16 +290,19 @@ class ShoppingGuideAgent:
         if not final_content:
             return {"final": True, "product_interacted": False}
 
-        # 1. 持久化 intent 到 MCP
-        self.exec_tool("store_memory",
-            node_type="session_intent",
-            content=json.dumps(final_content, ensure_ascii=False),
-            importance=0.9,
-            tags=f"session:{self._session_id}",
-        )
+        try:
+            # 1. 持久化 intent 到 MCP
+            self.exec_tool("store_memory",
+                node_type="session_intent",
+                content=json.dumps(final_content, ensure_ascii=False),
+                importance=0.9,
+                tags=f"session:{self._session_id}",
+            )
 
-        # 2. 保存导购阶段的完整会话（更新用户画像等）
-        self.end_session(context="导购阶段完成，转入产品搜索")
+            # 2. 保存导购阶段的完整会话（更新用户画像等）
+            self.end_session(context="导购阶段完成，转入产品搜索")
+        except Exception as e:
+            print(f"[_handle_final] 持久化 intent 失败: {e}", flush=True)
 
         return {"final": True, "product_interacted": False}
 
