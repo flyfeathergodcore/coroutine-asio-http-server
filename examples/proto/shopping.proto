@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package ai.shopping;
+
+// 购物导购微服务 — 由 C++ shopping_handler 通过 gRPC 调用
+service ShoppingService {
+  // 服务端流：C++ 发请求，Python 逐事件返回（meta / token / done）
+  rpc ChatStream(ShoppingRequest) returns (stream ShoppingEvent);
+
+  // 一元 RPC：重置会话
+  rpc ResetSession(ResetRequest) returns (ResetResponse);
+}
+
+message ShoppingRequest {
+  string session_id = 1;
+  string message = 2;
+}
+
+message ShoppingEvent {
+  oneof event {
+    MetaEvent   meta   = 1;
+    TokenEvent  token  = 2;
+    DoneEvent   done   = 3;
+    ErrorEvent  error  = 4;
+  }
+}
+
+message MetaEvent {
+  string session_id = 1;
+  string stage      = 2;
+  bool   ready      = 3;
+}
+
+message TokenEvent {
+  string token = 1;
+}
+
+message DoneEvent {
+  string               session_id = 1;
+  string               stage      = 2;
+  bool                 ready      = 3;
+  string               full_text  = 4;
+  repeated Candidate   candidates = 5;
+}
+
+message Candidate {
+  string name   = 1;
+  string price  = 2;
+  string rating = 3;
+}
+
+message ErrorEvent {
+  string message = 1;
+}
+
+message ResetRequest {
+  string session_id = 1;
+}
+
+message ResetResponse {
+  bool ok = 1;
+}

@@ -80,6 +80,14 @@ def __init__(
 
 同时删除 `self._product_agent = product_agent` 这一行。
 
+同时在 `exec_tool` 方法中删除涉及 `self._product_agent` 的 fallback 代码（guide agent 不再需要 product 组工具）：
+
+```python
+# ── exec_tool 中删除这段 ──
+if self._product_agent is not None and self._product_agent._mcp is not None:
+    clients.append(self._product_agent._mcp)
+```
+
 - [ ] **Step 2: 替换 _handle_final 方法**
 
 ```python

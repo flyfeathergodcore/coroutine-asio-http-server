@@ -15,7 +15,6 @@ import json, os, sys, time, re, asyncio
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-import grpc
 from grpc.aio import server as grpc_server
 import shopping_pb2, shopping_pb2_grpc
 
@@ -30,11 +29,8 @@ def _ensure_initialized():
     global _get_or_create_session, _sessions, _llm
     if _get_or_create_session is not None:
         return
-    from mcp_servers.mcp_setup import create_mcp_services, create_session_factory
-    from core.config import load_config
-    cfg = load_config()
-    guide_mcp, product_mcp, _llm = create_mcp_services(cfg)
-    _sessions, _get_or_create_session = create_session_factory(_llm, guide_mcp, product_mcp, cfg)
+    from mcp_servers.server import init_agents
+    _llm, _, _, _sessions, _get_or_create_session = init_agents()
 
 
 async def start_grpc_server(session_factory, sessions_dict=None, llm_client=None):
@@ -70,6 +66,21 @@ def _parse_tool_request(raw: str):
     return None
 
 
+def _is_guide_done(guide, result) -> bool:
+    """判断导购阶段是否已经完成，优先看返回文本，其次兼容旧 final 标记。"""
+    status = getattr(getattr(guide, "statusmachine", None), "status", None)
+    if status is not None:
+        if getattr(status, "value", "") == "done":
+            return True
+        if getattr(status, "name", "") == "DONE":
+            return True
+    if isinstance(result, str):
+        return "导购阶段完成" in result or "转入产品搜索阶段" in result
+    if isinstance(result, dict):
+        return bool(result.get("final") is True)
+    return False
+
+
 class ShoppingServicer(shopping_pb2_grpc.ShoppingServiceServicer):
     """gRPC 服务实现"""
 
@@ -91,13 +102,14 @@ class ShoppingServicer(shopping_pb2_grpc.ShoppingServiceServicer):
         try:
             if sess["stage"] == "guide":
                 # ── 导购阶段 ──
-                result = guide.analyze_l1([{"role": "user", "content": msg}])
+                guide_reply = guide.Run({"role": "user", "content": msg})
+                result = {"reply": guide_reply, "candidates": []}
 
-                if result.get("final") is True:
+                if _is_guide_done(guide, guide_reply):
                     # 切换到产品阶段
-                    print(f"[request] final detected → switch to product stage", flush=True)
+                    print(f"[request] guide done → switch to product stage", flush=True)
                     sess["stage"] = "product"
-                    sess["last_action"] = "final"
+                    sess["last_action"] = "guide_done"
                     result = product.product_main_loop(
                         session_id=sid, first_call=True)
 

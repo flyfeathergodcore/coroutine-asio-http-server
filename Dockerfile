@@ -27,7 +27,8 @@ RUN mkdir -p build/proto-gen/examples/proto && \
     cmake -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j$(nproc) --target http_server \
     && cmake --build build -j$(nproc) --target chat_handler \
-    && cmake --build build -j$(nproc) --target registerhandler
+    && cmake --build build -j$(nproc) --target registerhandler \
+    && cmake --build build -j$(nproc) --target shopping_handler
 
 # ═══════════════════════════════════════════
 # Stage 2 — Runtime image

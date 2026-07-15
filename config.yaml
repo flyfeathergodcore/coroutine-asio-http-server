@@ -20,4 +20,7 @@ proxy:
   - prefix: "/api/"
     upstreams:
       - "127.0.0.1:3000"
-      - "127.0.0.1:3001"    # 第二个上游，启动后自动参与轮询
+      - "127.0.0.1:3001"
+  - prefix: "/shopping/"
+    upstreams:
+      - "shopping-agent:8080"

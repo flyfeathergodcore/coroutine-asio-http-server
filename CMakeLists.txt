@@ -143,6 +143,19 @@ set(CHAT_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/build/proto-gen/examples/proto/chat.pb.cc
     ${CMAKE_SOURCE_DIR}/build/proto-gen/examples/proto/chat.grpc.pb.cc)
 add_hotplug_handler(examples/cpp_handlers/chat_handler.cpp)
+
+set(SHOPPING_PROTO_SRC
+    ${CMAKE_SOURCE_DIR}/build/proto-gen/examples/proto/shopping.pb.cc
+    ${CMAKE_SOURCE_DIR}/build/proto-gen/examples/proto/shopping.grpc.pb.cc)
+add_hotplug_handler(examples/cpp_handlers/shopping_handler.cpp)
+foreach(PROTO_FILE ${SHOPPING_PROTO_SRC})
+    if(EXISTS ${PROTO_FILE})
+        target_sources(shopping_handler PRIVATE ${PROTO_FILE})
+    endif()
+endforeach()
+target_include_directories(shopping_handler PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_grpc(shopping_handler)
+
 foreach(PROTO_FILE ${CHAT_PROTO_SRC})
     if(EXISTS ${PROTO_FILE})
         target_sources(chat_handler PRIVATE ${PROTO_FILE})

@@ -11,9 +11,9 @@ import json
 import os
 import time
 import logging
+from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, Any
-from datetime import datetime, timezone, timedelta
+from typing import Any, Callable, Optional, Set
 
 from core.llm_client import LLMClient
 from core.share_utils import load_text_file
@@ -87,6 +87,130 @@ class ProductAnalysis:
     price_comparisons: dict[str, PriceAnalysis] = field(default_factory=dict)
 
 
+class ProductState(Enum):
+    """产品 Agent 状态"""
+    INIT = "init"
+    SEARCHING = "searching"
+    RESPONDING = "responding"
+    DETAIL = "detail"
+    COMPARING = "comparing"
+    RECOMMENDING = "recommending"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class ProductStateMachine:
+    """产品 Agent 状态机"""
+
+    _TRANSITIONS: dict[ProductState, Set[ProductState]] = {
+        ProductState.INIT: {
+            ProductState.SEARCHING,
+            ProductState.RESPONDING,
+            ProductState.FAILED,
+        },
+        ProductState.SEARCHING: {
+            ProductState.RESPONDING,
+            ProductState.FAILED,
+        },
+        ProductState.RESPONDING: {
+            ProductState.SEARCHING,
+            ProductState.DETAIL,
+            ProductState.COMPARING,
+            ProductState.RECOMMENDING,
+            ProductState.DONE,
+            ProductState.FAILED,
+        },
+        ProductState.DETAIL: {
+            ProductState.RESPONDING,
+            ProductState.FAILED,
+        },
+        ProductState.COMPARING: {
+            ProductState.RESPONDING,
+            ProductState.FAILED,
+        },
+        ProductState.RECOMMENDING: {
+            ProductState.RESPONDING,
+            ProductState.DONE,
+            ProductState.FAILED,
+        },
+        ProductState.DONE: set(),
+        ProductState.FAILED: set(),
+    }
+
+    def __init__(self):
+        self.status = ProductState.INIT
+        self.previous_status: Optional[ProductState] = None
+        self.context: dict[str, Any] = {}
+        self.history: list[dict[str, Any]] = []
+        self.step_count = 0
+        self._on_enter_handlers: dict[ProductState, Callable] = {}
+
+    def reset(self):
+        self.status = ProductState.INIT
+        self.previous_status = None
+        self.context = {}
+        self.history = []
+        self.step_count = 0
+
+    def on_enter(self, state: ProductState, handler: Callable):
+        self._on_enter_handlers[state] = handler
+
+    def transition_to(self, target: ProductState, **kwargs) -> bool:
+        allowed = self._TRANSITIONS.get(self.status, set())
+        if target not in allowed:
+            logger.error("❌ 产品状态非法转移: %s -> %s", self.status.value, target.value)
+            return False
+
+        old_status = self.status
+        self.previous_status = old_status
+        self.history.append(
+            {
+                "from": old_status.value,
+                "to": target.value,
+                "timestamp": time.time(),
+                "step": self.step_count,
+            }
+        )
+
+        self.status = target
+        self.step_count += 1
+        logger.info("✅ 产品状态转移: %s -> %s", old_status.value, target.value)
+
+        if target in self._on_enter_handlers:
+            try:
+                ctx = {**self.context, **kwargs}
+                result = self._on_enter_handlers[target](ctx)
+                if result is not None:
+                    self.context[f"last_{target.value}_result"] = result
+            except Exception as exc:
+                logger.error("❌ 产品状态入口执行失败: %s", exc)
+                self.status = ProductState.FAILED
+                return False
+
+        return True
+
+    def go_to_SEARCHING(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.SEARCHING, **kwargs)
+
+    def go_to_RESPONDING(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.RESPONDING, **kwargs)
+
+    def go_to_DETAIL(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.DETAIL, **kwargs)
+
+    def go_to_COMPARING(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.COMPARING, **kwargs)
+
+    def go_to_RECOMMENDING(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.RECOMMENDING, **kwargs)
+
+    def go_to_DONE(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.DONE, **kwargs)
+
+    def go_to_FAILED(self, **kwargs) -> bool:
+        return self.transition_to(ProductState.FAILED, **kwargs)
+
+
 # ============================================================
 # ProductAgent
 # ============================================================
@@ -98,25 +222,6 @@ class ProductAgent:
     构造时自动拼接所有 product skill .md 文档到 system prompt。
     支持定时刷新商品库 + 价格过期检测。
     """
-
-    # 需要拼接的 product skill md 列表
-    SKILL_MD_FILES = [
-        "jingfen_query.md",
-        # "goods_query.md",  # 已屏蔽: goods.query 返回 403
-        "ware_search.md",
-        "rank_query.md",
-        "bigfield_query.md",
-        "category_query.md",
-        "get_product_detail.md",
-        "crawl_price.md",
-        "get_price_trend.md",
-        "price_compare.md",
-        "get_similar_products.md",
-        "link_products.md",
-        "query_relations.md",
-        "find_ecosystem.md",
-        "analyze_positioning.md",
-    ]
 
     # 定时刷新参数
     REFRESH_INTERVAL_SECONDS = 6 * 3600    # 每 6 小时刷新
@@ -166,6 +271,8 @@ class ProductAgent:
             {"type": "jingfen", "elite_id": 24, "limit": 20},
             {"type": "rank", "rank_id": 200006, "sort_type": 2, "limit": 10},
         ])
+
+        self.statusmachine = ProductStateMachine()
 
         # ── 新增实例变量（product_main_loop 循环状态）──
         self._product_history: list[dict] = []
@@ -804,6 +911,28 @@ class ProductAgent:
 
         return comparison
 
+    def _restore_product_history(self, session_id: str) -> bool:
+        """从会话中恢复 product 阶段历史。"""
+        session_resp = self._call_mcp("load_session", session_id=session_id)
+        if not isinstance(session_resp, list) or not session_resp:
+            return False
+
+        for row in session_resp:
+            if row.get("stage") != "product":
+                continue
+
+            content = row.get("content", [])
+            if isinstance(content, str):
+                content = json.loads(content)
+
+            self._product_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in content if m.get("role") in ("user", "agent")
+            ]
+            return bool(self._product_history)
+
+        return False
+
     # ================================================================
     # 新增: Product Main Loop — LLM 产品对话循环
     # ================================================================
@@ -827,29 +956,60 @@ class ProductAgent:
         Returns:
             {"reply": str, "candidates": list[dict]}
         """
+        self.statusmachine.reset()
+        self.statusmachine.context.update(
+            {
+                "session_id": session_id,
+                "first_call": first_call,
+                "user_message": user_message,
+            }
+        )
+
         if history is not None:
             self._product_history = history
 
         if first_call:
-            # 首次调用：从 MCP 读 intent → 搜索
-            self._current_intent = self._load_intent_from_mcp(session_id)
-            if not self._current_intent:
-                return {"reply": "导购信息不完整，请重新描述需求", "candidates": []}
+            self._product_history = []
+            self._current_intent = {}
+            self._current_analysis = None
+            self._current_candidates = []
 
-            self._current_analysis = self.search_by_guide_intent(self._current_intent)
-            self._current_candidates = (self._current_analysis.candidates or [])[:10]
+        reply = ""
 
-            if not self._current_candidates:
-                return {"reply": "未找到符合需求的产品，请调整需求", "candidates": []}
+        try:
+            if first_call:
+                self.statusmachine.go_to_SEARCHING(session_id=session_id)
+                self._restore_product_history(session_id)
 
-            # LLM 生成首次回复
-            reply = self._product_llm_first_response()
-            self._product_history.append({"role": "agent", "content": reply})
-        else:
-            # 后续调用：LLM 工具循环
-            self._product_history.append({"role": "user", "content": user_message})
-            reply = self._product_llm_with_tools()
-            self._product_history.append({"role": "agent", "content": reply})
+                if not self._current_intent:
+                    self._current_intent = self._load_intent_from_mcp(session_id)
+
+                if not self._current_intent:
+                    self.statusmachine.go_to_FAILED(reason="missing_intent")
+                    return {"reply": "导购信息不完整，请重新描述需求", "candidates": []}
+
+                if not self._current_analysis or not self._current_candidates:
+                    self._current_analysis = self.search_by_guide_intent(self._current_intent)
+                    self._current_candidates = (self._current_analysis.candidates or [])[:10]
+
+                if not self._current_candidates:
+                    self.statusmachine.go_to_FAILED(reason="no_candidates")
+                    return {"reply": "未找到符合需求的产品，请调整需求", "candidates": []}
+
+                self.statusmachine.go_to_RESPONDING(mode="first_call")
+                reply = self._product_llm_first_response()
+                self._product_history.append({"role": "agent", "content": reply})
+            else:
+                self.statusmachine.go_to_RESPONDING(mode="follow_up")
+                self._product_history.append({"role": "user", "content": user_message})
+                reply = self._product_llm_with_tools()
+                self._product_history.append({"role": "agent", "content": reply})
+
+            self.statusmachine.go_to_DONE(reply=reply, candidates=self._current_candidates)
+        except Exception as exc:
+            logger.exception("产品状态机执行失败: %s", exc)
+            self.statusmachine.go_to_FAILED(error=str(exc))
+            return {"reply": f"产品阶段处理失败: {exc}", "candidates": self._current_candidates}
 
         # 自动保存状态
         self._save_product_session(session_id)
@@ -857,7 +1017,21 @@ class ProductAgent:
         return {"reply": reply, "candidates": self._current_candidates}
 
     def _load_intent_from_mcp(self, session_id: str) -> dict:
-        """从 MCP 读取导购 agent 存储的 session_intent"""
+        """从会话表或 MCP 读取导购 agent 存储的 intent"""
+        # 1. 从 sessions 表 content 中查找 message_type=final 的消息
+        session_resp = self._call_mcp("load_session", session_id=session_id)
+        if isinstance(session_resp, list) and session_resp:
+            for row in session_resp:
+                if row.get("stage") == "guide":
+                    content = row.get("content", [])
+                    if isinstance(content, str):
+                        content = json.loads(content)
+                    for m in content:
+                        if m.get("message_type") == "final":
+                            return m.get("metadata", {})
+                    break
+
+        # 2. 兼容旧表：从 memory_nodes 查 session_intent 类型
         result = self._call_mcp("query_memory_by_type",
             mem_type="session_intent", limit=10)
         if not result:
@@ -867,7 +1041,6 @@ class ProductAgent:
         if isinstance(result, list):
             nodes = result
 
-        # 按 session_id 过滤
         for node in nodes:
             if isinstance(node, dict):
                 content = node.get("content", "")
@@ -877,7 +1050,6 @@ class ProductAgent:
                         return json.loads(content) if isinstance(content, str) else content
                     except json.JSONDecodeError:
                         return {}
-        # 如果 sessions_id 不匹配，取最新的
         for node in nodes:
             if isinstance(node, dict):
                 content = node.get("content", "")
@@ -950,6 +1122,7 @@ class ProductAgent:
             kwargs = action.get("kwargs", {})
 
             if action_type == "search":
+                self.statusmachine.go_to_SEARCHING(action="search", kwargs=kwargs)
                 keyword = kwargs.get("keyword", "")
                 brand = kwargs.get("brand", "")
                 price_min = kwargs.get("price_min", 0)
@@ -976,8 +1149,10 @@ class ProductAgent:
 
                 tool_output = f"搜索到 {len(self._current_candidates)} 款产品"
                 self._product_history.append({"role": "tool", "content": tool_output})
+                self.statusmachine.go_to_RESPONDING(tool_output=tool_output)
 
             elif action_type == "detail":
+                self.statusmachine.go_to_DETAIL(action="detail", kwargs=kwargs)
                 product_id = kwargs.get("product_id", "")
                 if product_id:
                     detail = self.answer_product_question(
@@ -985,8 +1160,10 @@ class ProductAgent:
                         candidates=self._current_candidates,
                     )
                     self._product_history.append({"role": "tool", "content": detail[:1000]})
+                self.statusmachine.go_to_RESPONDING(action="detail")
 
             elif action_type == "compare":
+                self.statusmachine.go_to_COMPARING(action="compare", kwargs=kwargs)
                 pids = kwargs.get("product_ids", [])
                 if pids:
                     result = self.compare_products(pids)
@@ -994,8 +1171,10 @@ class ProductAgent:
                         "role": "tool",
                         "content": json.dumps(result, ensure_ascii=False)[:1000],
                     })
+                self.statusmachine.go_to_RESPONDING(action="compare")
 
             elif action_type == "recommend":
+                self.statusmachine.go_to_RECOMMENDING(action="recommend", kwargs=kwargs)
                 # 生成推荐评分
                 intent_info = {"session_intent": self._current_intent, "user_profile": {}}
                 recs = self.generate_recommendations(
@@ -1004,6 +1183,7 @@ class ProductAgent:
                     "role": "tool",
                     "content": json.dumps([{"score": r.score, "reasons": r.reasons} for r in recs], ensure_ascii=False)[:1000],
                 })
+                self.statusmachine.go_to_RESPONDING(action="recommend")
 
         # Last iteration: if we get here, LLM only output tool calls.
         # Do one final LLM call to ensure a text response.
@@ -1049,16 +1229,17 @@ class ProductAgent:
         return None
 
     def _save_product_session(self, session_id: str):
-        """保存当前产品阶段状态到 MCP"""
-        state = {
-            "stage": "product",
-            "intent": self._current_intent,
-            "candidates": self._current_candidates[:10],
-            "history": self._product_history[-30:],
-        }
-        self._call_mcp("store_memory",
-            node_type="product_session",
-            content=json.dumps(state, ensure_ascii=False),
-            importance=0.8,
-            tags=f"session:{session_id}",
+        """保存当前产品阶段状态到新表"""
+        messages = []
+        for d in self._product_history[-30:]:
+            msg_type = "tool_result" if d.get("role") == "tool" else "chat"
+            messages.append({
+                "role": d["role"], "phase": "product", "message_type": msg_type,
+                "content": d["content"], "metadata": {},
+            })
+
+        self._call_mcp("save_session",
+            session_id=session_id,
+            stage="product",
+            content=messages,
         )

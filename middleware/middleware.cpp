@@ -157,6 +157,17 @@ void LoggingMiddleware::HandlePostSync(
     if (!pool)
         return;
 
+    // ── 容器 stdout（docker logs 可见）──
+    char line[512];
+    auto ms = elapsed_us / 1000.0;
+    auto n = std::snprintf(line, sizeof(line),
+        "[request] %s %s → %d (%.1fms, %zuB)\n",
+        ctx.Method().data(), ctx.Path().data(),
+        status_code, ms, bytes_sent);
+    // 在 post 阶段写 stderr（不会阻塞请求处理）
+    fwrite(line, 1, n, stderr);
+    fflush(stderr);
+
     // Build JSON line — thread_local buffer, no per-request alloc
     thread_local std::string j;
     j.clear();
@@ -170,7 +181,6 @@ void LoggingMiddleware::HandlePostSync(
 
     // std::to_string → snprintf to stack buffer
     char num[24];
-    int n;
     n = std::snprintf(num, sizeof(num), "%d", status_code);
     j.append(num, static_cast<size_t>(n));
 

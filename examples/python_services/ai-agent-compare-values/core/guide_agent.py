@@ -1,92 +1,138 @@
-"""
-导购Agent — 用户需求分析 + 用户摘要管理 + 短期记忆
-
-重构自 AnalysisAgent，通过 MCP 工具调用长期存储和会话持久化。
-
-生命周期:
-    1. session_start → load_profile (从 MCP 加载用户摘要，一句话画像)
-    2. 每轮对话 → analyze_l1 (增量分析 + 追问，传入用户摘要做参考)
-    3. 3-5轮后 → finalize (生成当前会话信息元，供 product_agent 使用)
-    4. session_end → update_user_summary (用本会话数据更新用户摘要) + save_session
-
-使用示例:
-    from core import ShoppingGuideAgent, LLMClient
-    from core.config import load_config
-
-    cfg = load_config()
-    llm = LLMClient(...)
-    mcp = MCPClient(group="memory")  # 只访问 memory 组工具
-
-    agent = ShoppingGuideAgent(llm=llm, mcp=mcp, config=cfg)
-    agent.start_session("sess_001", context="选购笔记本")
-
-    l1 = agent.analyze_l1([{"role": "user", "content": "想买8000左右的笔记本"}])
-    # → {profile_delta, intent_delta, gaps, follow_up_questions}
-"""
-
 import json
+import logging
 import os
 import re
 import time
-from typing import Optional, Any
+from typing import Any, Callable, Dict, Optional
+
+from mcp_servers.client import MCPClient
 from tools.json_parse import _construct_fallback_json
 
-from memory.models import MemoryNode
-from memory.short_memory import ShortMemoryBuffer
 from core.llm_client import LLMClient
-from core.share_utils import load_text_file, build_kwargs_with_user_id
+from core.share_utils import build_kwargs_with_user_id, load_text_file
+from core.status import AgentState
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class StatueMachine:
+    def __init__(self):
+        self.status = AgentState.INIT
+        self.previous_status = None
+        self.context: dict[str, Any] = {}
+        self.history: list[dict[str, Any]] = []
+        self.step_count = 0
+        self._on_enter_handlers: Dict[AgentState, Callable] = {}
+
+    def reset(self):
+        self.status = AgentState.INIT
+        self.previous_status = None
+        self.context = {}
+        self.history = []
+        self.step_count = 0
+
+    def on_enter(self, state: AgentState, handler: Callable):
+        self._on_enter_handlers[state] = handler
+
+    def transition_to(self, target: AgentState, **kwargs) -> bool:
+        if not self.status.can_go_to(target):
+            logger.error(f"❌ 非法转移: {self.status.value} -> {target.value}")
+            return False
+
+        if self.step_count > self.status.max_retries and not target.is_terminal:
+            logger.warning("⛔ 超过最大重试")
+            return False
+
+        old_status = self.status
+        self.previous_status = old_status
+        self.history.append(
+            {
+                "from": old_status.value,
+                "to": target.value,
+                "output": old_status.metadata.transition_context,
+                "timestamp": time.time(),
+                "step": self.step_count,
+            }
+        )
+
+        self.status = target
+        self.step_count = 0
+        logger.info(f"✅ 转移: {old_status.value} -> {target.value} (步数: {self.step_count})")
+
+        if target in self._on_enter_handlers:
+            logger.info(f"▶️ 执行入口动作: {target.value}")
+            try:
+                ctx = {**self.context, **kwargs}
+                result = self._on_enter_handlers[target](ctx)
+                if result is not None:
+                    self.context[f"last_{target.value}_result"] = result
+            except Exception as exc:
+                logger.error(f"❌ 入口动作执行失败: {exc}")
+                self.status = AgentState.FAILED
+                return False
+
+        return True
+
+    def go_to_DETAIL(self, **kwargs) -> bool:
+        return self.transition_to(AgentState.DETAIL, **kwargs)
+
+    def go_to_ASKING(self, **kwargs) -> bool:
+        return self.transition_to(AgentState.ASKING, **kwargs)
+
+    def go_to_DONE(self, **kwargs) -> bool:
+        return self.transition_to(AgentState.DONE, **kwargs)
+
+    def go_to_FAILED(self, **kwargs) -> bool:
+        return self.transition_to(AgentState.FAILED, **kwargs)
+
+    def go_to_OBSERVING(self, **kwargs) -> bool:
+        return self.transition_to(AgentState.OBSERVING, **kwargs)
 
 
 class ShoppingGuideAgent:
-    """
-    导购Agent — 分析用户购买需求、管理用户画像、维护短期记忆。
-    """
+    """导购 Agent：负责需求识别、追问、工具调用和会话状态推进。"""
 
     def __init__(
         self,
         llm: LLMClient,
-        mcp: Any = None,  # MCPClient (memory 组)
         config: Optional[dict] = None,
-        short_memory_volume: int = 100,
         l1_temperature: float = 0.1,
         finalize_temperature: float = 0.1,
+        statue_machine: Optional[StatueMachine] = None,
     ):
-        """
-        llm: LLMClient 实例
-        mcp: MCP 客户端（memory 组工具），不传则降级为本地存储
-        config: YAML 配置字典（用于读取 prompt 路径）
-        """
         cfg = config or {}
         self.llm = llm
-        self._mcp = mcp
+        self._mcp = MCPClient(role="guide_agent")
         self._session_id = ""
+        self._user_id = ""
+        self._user_summary: str = ""
+        self._all_dialogues: list[dict] = []
+        self._tool_call_content: list[dict] = []
+        self._previous_analyses: list[str] = []
+        self._short_memory: list[Any] = []
+        self._skill_list: str = ""
+        self._skill_context: str = ""
+        self._product_prompt: Any = None
+        self._session_ready = False
 
-        # prompt 路径
-        self._config_dir = os.path.dirname(os.path.abspath(
-            os.getenv("CONFIG_PATH", "config.yaml")
-        ))
+        self._config_dir = os.path.dirname(os.path.abspath(os.getenv("CONFIG_PATH", "config.yaml")))
         prompt_cfg = cfg.get("prompts", {})
         print(prompt_cfg)
         defaults = {
             "guide_system": "prompts/guide_system.txt",
             "guide_l1": "prompts/guide_l1.txt",
-            "guide_qa": "prompts/guide_qa.txt",
-            "guide_finalize": "prompts/guide_finalize.txt",
-            "guide_summary": "prompts/guide_summary.txt",
         }
         self._prompts: dict[str, str] = {}
         for key, default_path in defaults.items():
             raw = prompt_cfg.get(key, default_path)
             self._prompts[key] = raw if os.path.isabs(raw) else os.path.join(self._config_dir, raw)
 
-        # 加载系统提示词
         self._system_prompt = self._load_prompt("guide_system")
         self._l1_prompt = self._load_prompt("guide_l1")
 
-        # 温度
         guide_cfg = cfg.get("guide_agent", {})
         self._l1_temp = l1_temperature or guide_cfg.get("l1_temperature", 0.1)
-        # ENV 覆盖（方便调参）
         env_temp = os.getenv("L1_TEMPERATURE")
         if env_temp:
             try:
@@ -95,457 +141,492 @@ class ShoppingGuideAgent:
                 pass
         self._finalize_temp = finalize_temperature or guide_cfg.get("finalize_temperature", 0.1)
 
-        # 短期记忆
-        vol = short_memory_volume or guide_cfg.get("short_memory_volume", 100)
-        self._short_memory = ShortMemoryBuffer(volume=vol)
+        self.statusmachine = statue_machine or StatueMachine()
+        self._intent = {
+            "category": "",
+            "intent_delta": {
+                "core_need": "",
+                "constraints": [],
+                "budget": {"current": 0, "min": 0, "max": 0, "confidence": "high"},
+            },
+        }
 
-        # 状态记录
-        self._user_summary: str = ""               # 用户的一句话消费特征摘要（来自 DB）
-        self._all_dialogues: list[dict] = []       # 完整对话记录
-        self._tool_call_content: list[dict] = []   # 工具记录
-        self._previous_analyses: list[str] = []    # 每轮 L1 分析结果追加，供后续轮次参考
-        self._skill_filled_prompt: str =None
-        self._product_prompt:list[dict]=[]
-        self._l1_count: int = 0
-        self._recommended_products: list[dict] = []
-        self._product_followups: list[dict] = []
+        try:
+            self._skill_context = self.exec_tool("get_skill_context", role="guide") or ""
+        except Exception:
+            self._skill_context = ""
 
-        # skill 加载状态（跨 analyze_l1 轮次持久化）
-        self._skill_loaded: bool = False            # 品类 skill 是否已加载
-        self._loaded_skill_context: str = ""        # 已加载的品类上下文（注入 skill_filled_prompt）
-        self._products_loaded: bool = False          # 产品列表是否已加载
+    def _prepare_session_runtime(self) -> None:
+        if self._session_ready:
+            return
 
-        # 加载产品 skill 提示词（通过 MCP find_product_prompt 动态获取）
-        self._last_category: str = ""
-        self._last_candidates: list[dict] = []
+        try:
+            self._mcp.client.connect()
+        except Exception as exc:
+            logger.warning(f"连接 MCP 失败: {exc}")
 
-    # ================================================================
-    # 会话生命周期
-    # ================================================================
+        if not self._user_summary:
+            self.load_profile()
+
+        if not self._skill_list:
+            skill_context = self._skill_context
+            if not skill_context:
+                try:
+                    if hasattr(self._mcp, "get_skill_context"):
+                        skill_context = self._mcp.get_skill_context()
+                    else:
+                        skill_context = self.exec_tool("get_skill_context", role="guide") or ""
+                except Exception as exc:
+                    logger.warning(f"加载 skill 上下文失败: {exc}")
+                    skill_context = ""
+
+            self._skill_list = skill_context if isinstance(skill_context, str) else json.dumps(skill_context, ensure_ascii=False)
+
+        if not self._short_memory:
+            self._short_memory.append(
+                {"当前目标": "需要了解并确认用户需求哪些品类的产品，首次交互先完成打招呼和需求引导"}
+            )
+
+        self._session_ready = True
+
+    def _build_prompt(self, session_dialogues: str, product_prompt: str = "") -> str:
+        return self._l1_prompt.format(
+            user_summary=self._user_summary or "（无）",
+            skill_list=self._skill_list or self._skill_context or "（无）",
+            product_prompt=product_prompt,
+            session_dialogues=session_dialogues,
+            short_memory=self._short_memory,
+        )
+
+    def _append_tool_memory(self, tool_name: str, tool_resp: Any) -> None:
+        self._tool_call_content.append({"tool": tool_name, "result": tool_resp})
+        self._short_memory.append({"已执行工具": tool_name, "返回结果": tool_resp})
+
+    def _update_intent(self, category: Any = None, intent_delta: Optional[dict] = None) -> None:
+        if category:
+            if isinstance(category, dict):
+                self._intent.update(category)
+            else:
+                self._intent["category"] = category
+
+        if isinstance(intent_delta, dict):
+            current_delta = self._intent.setdefault(
+                "intent_delta",
+                {
+                    "core_need": "",
+                    "constraints": [],
+                    "budget": {"current": 0, "min": 0, "max": 0, "confidence": "high"},
+                },
+            )
+            current_delta.update(intent_delta)
+
+    def _intent_ready(self) -> bool:
+        intent_delta = self._intent.get("intent_delta") or {}
+        return bool(
+            self._intent.get("category")
+            and intent_delta.get("core_need")
+            and intent_delta.get("constraints")
+            and intent_delta.get("budget")
+        )
+
+    def _consume_llm_result(self, prompt: str) -> tuple[str, dict[str, Any]] | None:
+        result = self._llm_call(prompt)
+        if result is None:
+            result = self._llm_call(prompt + "请严格按照输出格式输出")
+        return result
 
     def set_user_id(self, user_id: str):
-        """设置当前用户 ID，加载该用户的画像"""
         self._user_id = user_id
 
+    def load_profile(self) -> str:
+        if not self._user_id:
+            return ""
+
+        kwargs = build_kwargs_with_user_id(self._user_id, {"mem_type": "user_summary"})
+        resp = self.exec_tool("load_user_profile", **kwargs)
+        summary = ""
+        if isinstance(resp, dict):
+            profiles = resp.get("profiles", [])
+            if profiles:
+                last = profiles[-1]
+                if isinstance(last, dict):
+                    summary = json.dumps(last, ensure_ascii=False)
+                elif isinstance(last, str):
+                    summary = last
+            elif isinstance(resp.get("summary"), str):
+                summary = resp["summary"]
+        elif isinstance(resp, str):
+            summary = resp
+
+        self._user_summary = summary
+        return self._user_summary
+
     def start_session(self, session_id: str = "", context: str = "", user_id: str = ""):
-        """开始新会话，加载历史用户画像"""
         self._session_id = session_id or f"sess_{int(time.time())}"
         self._user_id = user_id or ""
-        # 从 MCP 加载历史画像（传入 user_id 按用户过滤）
+        self._reset()
+        self.statusmachine.reset()
+        self._session_ready = False
         self.load_profile()
-        # 可选：加载历史会话
 
-        # 可选：加载历史会话
         if session_id:
-            self.exec_tool("load_session", session_id=session_id)
+            resp = self.exec_tool("load_session", session_id=session_id)
+            if isinstance(resp, list) and resp:
+                self._restore_from_session(resp)
 
         return self._session_id
 
-    def end_session(self, context: str = "") -> None:
-        """
-        结束当前会话。
-        1. 生成/更新用户摘要（基于原始历史数据，覆盖存储）
-        2. 压缩短期记忆
-        3. 通过 MCP 保存会话记录
-        """
-        # 1. 生成/更新用户摘要（new! 基于原始数据，而非摘要的摘要）
-        if self._user_id:
-            try:
-                self.update_user_summary()
-            except Exception as e:
-                print(f"[end_session] 更新摘要失败: {e}", flush=True)
+    def _restore_from_session(self, session_data: list):
+        if not session_data:
+            return
 
-        # 2. 压缩短期记忆
-        compact_result = self._short_memory.compact()
+        row = next((r for r in session_data if r.get("stage") == "guide"), session_data[0])
+        messages = row.get("content", [])
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        if not isinstance(messages, list):
+            return
 
-        # 3. MCP 保存会话
-        dialogues_json = json.dumps(self._all_dialogues, ensure_ascii=False)
-        self.exec_tool("save_session",
+        for message in messages:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            msg_type = message.get("message_type", "")
+            metadata = message.get("metadata") or {}
+
+            if role in ("user", "agent") and msg_type == "chat":
+                self._all_dialogues.append({"role": role, "content": content})
+            elif role == "system" and msg_type == "analysis":
+                analysis_text = metadata.get("analysis_text", "")
+                if analysis_text:
+                    self._previous_analyses.append(analysis_text)
+            elif role == "tool" and msg_type == "tool_result":
+                self._tool_call_content.append({"content": content, "metadata": metadata})
+                tool_name = metadata.get("tool_name", "")
+                if tool_name == "find_product_prompt" and self._product_prompt is None:
+                    self._product_prompt = content
+
+    def end_session(self, context: str = "", last_intent: str = "") -> None:
+        messages = []
+        for dialogue in self._all_dialogues:
+            messages.append(
+                {
+                    "role": dialogue["role"],
+                    "phase": "guide",
+                    "message_type": "chat",
+                    "content": dialogue["content"],
+                    "metadata": {},
+                }
+            )
+
+        for analysis_text in self._previous_analyses:
+            messages.append(
+                {
+                    "role": "system",
+                    "phase": "guide",
+                    "message_type": "analysis",
+                    "content": "",
+                    "metadata": {"analysis_text": analysis_text},
+                }
+            )
+
+        for tool_item in self._tool_call_content:
+            if isinstance(tool_item, dict):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "phase": "guide",
+                        "message_type": "tool_result",
+                        "content": json.dumps(tool_item, ensure_ascii=False),
+                        "metadata": {},
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "phase": "guide",
+                        "message_type": "tool_result",
+                        "content": str(tool_item),
+                        "metadata": {},
+                    }
+                )
+
+        self.exec_tool(
+            "save_session",
             session_id=self._session_id,
-            context=context,
-            dialogues=dialogues_json,
+            stage="guide",
+            content=messages,
         )
         self._reset()
+        self.statusmachine.reset()
+        self._session_ready = False
 
-    # ================================================================
-    # 用户画像
-    # ================================================================
+    def Run(self, session_message: dict) -> str:
+        if session_message:
+            self._all_dialogues.append(session_message)
 
-    def load_profile(self) -> str:
-        """
-        从 MCP 加载用户摘要（user_summary 类型，一句话消费特征）。
-        存入 self._user_summary 供 analyze_l1 传给 LLM。
-        """
-        kwargs = build_kwargs_with_user_id(self._user_id, {"mem_type": "user_summary"})
-        resp = self.exec_tool("load_user_profile", **kwargs)
-        profiles = resp.get("profiles", []) if isinstance(resp, dict) else []
-        if profiles:
-            last = profiles[-1]
-            if isinstance(last, dict):
-                self._user_summary = json.dumps(last, ensure_ascii=False)
-            elif isinstance(last, str):
-                self._user_summary = last
+        self._prepare_session_runtime()
 
-        return self._user_summary
+        if self.statusmachine.status.is_terminal:
+            return "当前会话已结束"
 
-    # ================================================================
-    # 用户摘要（每个用户一条，覆盖更新）
-    # ================================================================
+        for _ in range(8):
+            state = self.statusmachine.status
+            session_dialogues = self._format_dialogues(self._all_dialogues)
+            prompt = self._build_prompt(session_dialogues, self._product_prompt or "")
 
-    def update_user_summary(self) -> dict:
-        """
-        基于当前会话数据重新生成用户的消费特征摘要。
+            reply, advanced = self._drive_state(state, prompt)
+            if reply is not None:
+                return reply
+            if advanced:
+                continue
 
-        不依赖任何旧记忆（user_profile 已废弃），每次仅基于当前会话数据。
-        未来可扩展为加载订单、评价等原始数据。
-        覆盖存储为每个用户一条的纯文本摘要。
-        """
-        if not self._user_id:
-            return {}
+            if self.statusmachine.status.is_terminal:
+                return "当前会话已结束"
+            break
 
-        # 组装 prompt（用原始对话记录替代已废弃的累积 profile）
-        session_data = self._format_dialogues(self._all_dialogues) if self._all_dialogues else "（本轮会话无数据）"
-        prompt = self._load_prompt("guide_summary").format(
-            historical_records="（暂无历史数据）",
-            session_data=session_data,
-        )
+        self.statusmachine.go_to_FAILED()
+        return "当前状态无法处理请求，请检查状态机状态"
 
-        try:
-            print(f"[agent] update_summary  prompt_len={len(prompt)}", flush=True)
-            t0 = time.time()
-            result_text = self.llm.chat(
-                prompt,
-                system_prompt=self._system_prompt,
-                temperature=0.1,
-            )
-            result_text = result_text.strip().strip('"\'')
-            t1 = time.time()
-            print(f"[agent] update_summary ← {len(result_text)}B  {((t1-t0)*1000):.0f}ms", flush=True)
-        except Exception as e:
-            print(f"[update_user_summary] LLM 调用失败: {e}", flush=True)
-            result_text = ""
+    def _drive_state(self, state: AgentState, prompt: str) -> tuple[Optional[str], bool]:
+        tool_map: dict[str, int] = {}
+        for _ in range(state.max_retries):
+            result = self._consume_llm_result(prompt)
+            if result is None:
+                continue
 
-        if not result_text:
-            return {}
+            analyse_text, payload = result
+            if analyse_text:
+                self._previous_analyses.append(analyse_text)
+                self._short_memory.append(analyse_text)
 
-        # 3. 覆盖存储（固定 node_id 保证每个用户只存一条）
-        node_id = f"summary_{self._user_id}"
-        try:
-            self.exec_tool("store_memory",
-                node_type="user_summary",
-                content=result_text,
-                importance=0.9,
-                tags=f"user:{self._user_id}",
-                node_id=node_id,
-            )
-        except Exception as e:
-            print(f"[update_user_summary] 存储失败: {e}", flush=True)
+            action_type = payload.get("type")
+            if action_type == "tool":
+                tool_name = payload["tool_name"]
+                tool_map[tool_name] = tool_map.get(tool_name, 0) + 1
+                if tool_map[tool_name] > 2:
+                    self.statusmachine.go_to_FAILED()
+                    return "重复使用工具，任务退出", False
 
-        return {"summary": result_text}
+                tool_resp = self.exec_tool(tool_name, payload.get("kwargs", {}))
+                if tool_name == "find_product_prompt":
+                    self._product_prompt = tool_resp
+                else:
+                    self._append_tool_memory(tool_name, tool_resp)
+                continue
 
-    def set_last_candidates(self, candidates: list[dict]):
-        """存储最近推荐结果，供 check_product_exists 等后续查询"""
-        self._last_candidates = candidates or []
+            if action_type == "intent":
+                self._update_intent(payload.get("category"), payload.get("intent_delta"))
+                if self._intent_ready():
+                    if state in (AgentState.INIT, AgentState.DETAIL, AgentState.ASKING):
+                        self.statusmachine.go_to_OBSERVING(target=payload)
+                    return None, True
+                continue
 
-    # ================================================================
-    # L1 增量分析
-    # ================================================================
+            if action_type == "question":
+                question = payload.get("question_content", "")
+                if state in (AgentState.INIT, AgentState.DETAIL):
+                    self.statusmachine.go_to_ASKING(target=payload)
+                elif state == AgentState.OBSERVING:
+                    self.statusmachine.go_to_DETAIL(target=payload)
+                return question, False
+
+            if action_type == "final":
+                final_content = payload.get("final_content", {})
+                if final_content:
+                    try:
+                        self.exec_tool(
+                            "store_memory",
+                            node_type="session_intent",
+                            content=json.dumps(final_content, ensure_ascii=False),
+                            importance=0.9,
+                            tags=f"session:{self._session_id}",
+                        )
+                    except Exception as exc:
+                        logger.warning(f"持久化 intent 失败: {exc}")
+
+                self.statusmachine.go_to_DONE(target=payload)
+                self.end_session(
+                    context="导购阶段完成，转入产品搜索",
+                    last_intent=json.dumps(final_content, ensure_ascii=False) if final_content else "",
+                )
+                return "用户确认了意图，导购阶段完成，转入产品搜索阶段", False
+
+            if payload.get("category") or payload.get("intent_delta"):
+                self._update_intent(payload.get("category"), payload.get("intent_delta"))
+                if self._intent_ready():
+                    self.statusmachine.go_to_OBSERVING(target=payload)
+                    return None, True
+
+        if state == AgentState.INIT:
+            self.statusmachine.go_to_FAILED()
+            return "初始化失败，暂不能提供服务，请稍后再试", False
+        if state == AgentState.DETAIL:
+            self.statusmachine.go_to_FAILED()
+            return "长时间使用工具，导致 DETAIL 模式失败", False
+        if state == AgentState.ASKING:
+            return "当前仍在收集信息，请继续补充需求", False
+        if state == AgentState.OBSERVING:
+            self.statusmachine.go_to_FAILED()
+            return "当前状态无法处理请求，请检查状态机状态", False
+        return None, False
 
     def analyze_l1(self, dialogues: list[dict]) -> dict:
-        """
-        每轮对话后调用：分析用户本轮需求，找出信息缺口并给出追问。
-
-        LLM 可主动输出 tool 请求来加载品类 skill prompt：
-          {"tool": true, "category": "笔记本电脑"}
-        系统收到后调 MCP 加载追问 prompt，再重新调 LLM。
-
-        dialogues: [{"role": "user"|"agent", "content": "..."}, ...]
-
-        返回:
-          {"reply": "追问文本", "intent": None}
-        """
         self._all_dialogues.extend(dialogues)
         session_dialogues = self._format_dialogues(self._all_dialogues)
-
-        #注入长期记忆（用户摘要+skill描述），以及短期记忆（用户会话+agent分析）
         prompt = self._l1_prompt.format(
-            user_summary = self._user_summary or "（无）",
-            product_skills = self._product_prompt,
-            tool_call_content = self._tool_call_content,
-            session_dialogues = session_dialogues,
-            previous_analyses = self._previous_analyses
+            user_summary=self._user_summary or "（无）",
+            skill_list=self._skill_context,
+            product_prompt=self._product_prompt or "",
+            tool_call_content=self._tool_call_content,
+            session_dialogues=session_dialogues,
+            previous_analyses=self._previous_analyses,
         )
+
         result = self._llm_call_with_tool_handling(prompt, session_dialogues)
+        if result is None:
+            return {"reply": None, "intent": None}
         if result.get("reply") is not None:
             return {"reply": result["reply"]}
-        elif result.get("final") is True:
+        if result.get("final") is True:
             return self._handle_final(result.get("final_content", {}))
+        return {"reply": None, "intent": None}
 
     def _handle_final(self, final_content: dict) -> dict:
-        """
-        LLM 认为信息已收集完毕 → 将 intent 持久化到 MCP，返回 final 信号。
-
-        不调 product_agent，不搜索，不设 _recommended_products。
-        """
         if not final_content:
             return {"final": True, "product_interacted": False}
 
         try:
-            # 1. 持久化 intent 到 MCP
-            self.exec_tool("store_memory",
+            self.exec_tool(
+                "store_memory",
                 node_type="session_intent",
                 content=json.dumps(final_content, ensure_ascii=False),
                 importance=0.9,
                 tags=f"session:{self._session_id}",
             )
-
-            # 2. 保存导购阶段的完整会话（更新用户画像等）
-            self.end_session(context="导购阶段完成，转入产品搜索")
-        except Exception as e:
-            print(f"[_handle_final] 持久化 intent 失败: {e}", flush=True)
+            self.end_session(
+                context="导购阶段完成，转入产品搜索",
+                last_intent=json.dumps(final_content, ensure_ascii=False),
+            )
+        except Exception as exc:
+            print(f"[_handle_final] 持久化 intent 失败: {exc}", flush=True)
 
         return {"final": True, "product_interacted": False}
 
     def _llm_call_with_tool_handling(self, prompt: str, session_dialogues: str, max_iterations: int = 3) -> dict:
-        """
-        调用 LLM 并处理工具调用循环
-    
-        Args:
-            prompt: 初始提示词
-            max_iterations: 最大迭代次数，防止死循环
-    
-        Returns:
-            dict: 最终响应
-        """
         iteration = 0
         current_prompt = prompt
         while iteration < max_iterations:
             iteration += 1
             result = self._llm_call(current_prompt)
             if result is None:
-                result = self._llm_call(current_prompt+"请严格按照输出格式输出")
+                result = self._llm_call(current_prompt + "请严格按照输出格式输出")
                 if result is None:
                     raise ValueError("模型调用失败")
-            analyse_text, params = result
-            self._previous_analyses.append(analyse_text)
 
-            if params.get("tool") is True:
+            analyse_text, params = result
+            if analyse_text:
+                self._previous_analyses.append(analyse_text)
+
+            action_type = params.get("type")
+            if action_type == "tool":
                 tool_name = params["tool_name"]
                 tool_params = params["kwargs"]
                 tool_call = self.exec_tool(tool_name=tool_name, tool_params=tool_params)
                 if tool_call is None:
                     continue
-                if tool_name == "find_product_prompt" and self._skill_filled_prompt is None:
-                    self._skill_filled_prompt = tool_call.get("output", "")
+                if tool_name == "find_product_prompt" and self._product_prompt is None:
+                    self._product_prompt = tool_call.get("output", "") if isinstance(tool_call, dict) else tool_call
                 else:
-                    self._tool_call_content.append(tool_call.get("output", ""))
+                    self._tool_call_content.append(tool_call.get("output", "") if isinstance(tool_call, dict) else tool_call)
+
                 current_prompt = self._l1_prompt.format(
-                    user_summary = self._user_summary or "（无）",
-                    product_skills = self._product_prompt,
-                    tool_call_content = self._tool_call_content,
-                    session_dialogues = session_dialogues,
-                    previous_analyses = self._previous_analyses
+                    user_summary=self._user_summary or "（无）",
+                    skill_list=self._skill_context,
+                    product_prompt=self._product_prompt or "",
+                    tool_call_content=self._tool_call_content,
+                    session_dialogues=session_dialogues,
+                    previous_analyses=self._previous_analyses,
                 )
-            elif params.get("question") is True:
+            elif action_type == "question":
                 return {"reply": params.get("question_content"), "intent": None}
-
-            elif params.get("final") is True:
+            elif action_type == "final":
                 return {"final": True, "final_content": params.get("final_content")}
+            elif action_type == "intent":
+                return {"intent": params.get("intent_delta", {}), "category": params.get("category")}
 
-
-            
-
+        return {"reply": None, "intent": None}
 
     def _llm_call(self, prompt: str) -> tuple[str, dict[str, Any]] | None:
-        """调用 LLM 返回原始文本"""
         try:
             print(f"[agent] L1 analyze  prompt_len={len(prompt)}  temp={self._l1_temp}", flush=True)
             t0 = time.time()
-            orig_temp = self.llm.temperature
+            original_temp = self.llm.temperature
             self.llm.temperature = self._l1_temp
             raw_result = self.llm.chat(prompt, system_prompt=self._system_prompt).strip()
-            self.llm.temperature = orig_temp
+            self.llm.temperature = original_temp
             t1 = time.time()
-            print(f"[agent] L1 ← {len(raw_result)}B  {((t1-t0)*1000):.0f}ms", flush=True)
-            result = self._parse_request(raw_result)
-            return result
-        except Exception as e:
-            print(f"[agent] L1 ✗ {e}", flush=True)
+            print(f"[agent] L1 ← {len(raw_result)}B  {((t1 - t0) * 1000):.0f}ms", flush=True)
+            return self._parse_request(raw_result)
+        except Exception as exc:
+            print(f"[agent] L1 ✗ {exc}", flush=True)
             return None
 
     def _parse_request(self, raw: str) -> tuple[str, dict[str, Any]] | None:
-        """
-            解析输出请求有以下几种：
-            [agent_analyse]:...........
-            [json]:{"tool":true,"tool_name":"find_product_prompt", "kwargs": {"参数名1"：参数值，"参数名2":参数值}}
-            
-            [agent_analyse]:...........
-            [json]:{"question":true,"question_content":"模型输出的问题"}
-            
-            [agent_analyse]:...........
-            [json]:{"final":true,"final_content":{
-                "category": "产品品类",
-                "intent_delta": {
-                "core_need": "一句话概括核心需求",
-                "constraints": ["所有硬性要求"],
-                "budget": {{"current": 0, "min": 0, "max": 0, "confidence": "high"}},
-                "status": "confirmed"
-                },
-                "gaps": [],
-                "follow_up_questions": []}
-                }
-            
-            [agent_analyse]:...........
-            [json]:{"promote":true,"promote_product":{"模型推荐的产品1":"理由","模型推荐的产品2":"理由"}}
-        """
         if not raw:
             return None
 
-        # 使用正则表达式匹配 [agent_analyse] 和 [json] 格式
-        agent_analyse_pattern = r'\[agent_analyse\]:(.*?)(?=\n\[json\]|$)'
-        json_pattern = r'\[json\]:(.*?)(?=\n\[agent_analyse\]|$)'
-        parsed_data = None
+        agent_analyse_pattern = r"\[agent_analyse\]:(.*?)(?=\n\[json\]|$)"
+        json_pattern = r"\[json\]:(.*?)(?=\n\[agent_analyse\]|$)"
 
-        # 查找所有匹配
         agent_analyse_matches = re.findall(agent_analyse_pattern, raw, re.DOTALL)
         json_matches = re.findall(json_pattern, raw, re.DOTALL)
 
-        # 如果没有 json 匹配，尝试直接解析整个 raw
+        parsed_data = None
         if not json_matches:
             parsed_data = _construct_fallback_json(raw)
         else:
-        # 解析 JSON 数据
-            
             for json_str in json_matches:
                 try:
                     data = json.loads(json_str.strip())
                     if isinstance(data, dict):
                         parsed_data = data
-                        break  # 取第一个有效的 JSON
-                except json.JSONDecodeError as e:
-                    print(f"JSON 解析错误: {e}")
-                    continue
+                        break
+                except json.JSONDecodeError as exc:
+                    print(f"JSON 解析错误: {exc}")
 
         if parsed_data is None:
             return None
 
-        # 处理各种类型的请求
-        # 1. tool 类型
+        analysis_text = "\n".join(agent_analyse_matches).strip() if agent_analyse_matches else ""
+
         if parsed_data.get("tool") is True:
             tool_name = parsed_data.get("tool_name")
             kwargs = parsed_data.get("kwargs")
             if tool_name and kwargs:
-                # 将 agent_analyse 内容合并到返回中
-                return (
-                    "\n".join(agent_analyse_matches).strip() if agent_analyse_matches else "",
-                    {"tool_name": tool_name, "kwargs": kwargs}
-                )
+                return analysis_text, {"type": "tool", "tool_name": tool_name, "kwargs": kwargs}
             return None
 
-        # 2. question 类型
         if parsed_data.get("question") is True:
             question_content = parsed_data.get("question_content")
             if question_content:
-                return (
-                    "\n".join(agent_analyse_matches).strip() if agent_analyse_matches else "",
-                    {"question": True, "question_content": question_content}
-                )
+                return analysis_text, {"type": "question", "question_content": question_content}
             return None
 
-        # 3. final 类型
         if parsed_data.get("final") is True:
-            return (
-                "\n".join(agent_analyse_matches).strip() if agent_analyse_matches else "",
-                {"final": True, "final_content": parsed_data.get("final_content",{})}
-            )
+            return analysis_text, {"type": "final", "final_content": parsed_data.get("final_content", {})}
 
-        # 4. promote 类型
-        if parsed_data.get("promote") is True:
-            promote_product = parsed_data.get("promote_product")
-            if promote_product and isinstance(promote_product, dict):
-                return (
-                    "\n".join(agent_analyse_matches).strip() if agent_analyse_matches else "",
-                    {"promote": True, "promote_product": promote_product}
-                )
-            return None
+        if parsed_data.get("category") or parsed_data.get("intent_delta"):
+            payload = {"type": "intent"}
+            if parsed_data.get("category"):
+                payload["category"] = parsed_data.get("category")
+            if parsed_data.get("intent_delta"):
+                payload["intent_delta"] = parsed_data.get("intent_delta")
+            return analysis_text, payload
+
         return None
 
-
-
-    # ================================================================
-    # 产品交互记录
-    # ================================================================
-
-    def record_recommendation(self, candidates: list[dict], recommendations: list[dict] = None):
-        """
-        记录本次推荐的产品列表，供 session_info 持久化。
-
-        candidates: search_by_guide_intent 返回的候选列表
-        recommendations: LLM 推荐评分（可选），格式 [{product: {id, name, ...}, score, reasons}]
-        """
-        self._recommended_products = []
-        seen = set()
-        for c in (candidates or []):
-            pid = str(c.get("id", ""))
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            entry = {
-                "product_id": pid,
-                "name": c.get("name", ""),
-                "price": c.get("current_price", c.get("price", 0)),
-                "brand": c.get("brand", ""),
-                "rating": c.get("rating", 0),
-                "url": c.get("url", ""),
-            }
-            # 合并 LLM 推荐评分
-            if recommendations:
-                for r in recommendations:
-                    rp = r.get("product", {})
-                    if str(rp.get("id", "")) == pid:
-                        entry["score"] = r.get("score")
-                        entry["reasons"] = r.get("reasons", [])
-                        entry["caveats"] = r.get("caveats", [])
-            self._recommended_products.append(entry)
-        # 限制最多保留 5 条
-        self._recommended_products = self._recommended_products[:5]
-
-    def record_product_followup(self, product_id: str, question: str, answer: str = ""):
-        """
-        记录用户对某款产品的追问。
-
-        自动从 _recommended_products 中查找产品名。
-        调用时机：用户问"这款散热怎么样？"时，由外层服务调用。
-        """
-        product_name = ""
-        for p in self._recommended_products:
-            if p.get("product_id") == product_id:
-                product_name = p.get("name", "")
-                break
-
-        self._product_followups.append({
-            "product_id": product_id,
-            "product_name": product_name,
-            "question": question,
-            "answer": answer,
-            "asked_at": time.time(),
-        })
-
     def exec_tool(self, tool_name: str, tool_params: dict | None = None, **kwargs) -> Any:
-        """
-        通过 MCP 客户端动态调用工具。
-
-        收集所有可用 MCP 客户端（memory → product），逐个尝试调用。
-        由 MCP 注册表决定工具属于哪个组，不再硬编码路由。
-
-        Args:
-            tool_name: MCP 工具名，需已注册到 MCP 服务端
-            tool_params: 工具参数字典，与 kwargs 二选一
-            kwargs: 关键字参数形式
-
-        Returns:
-            工具执行结果，失败返回 None
-        """
         params = tool_params if tool_params is not None else kwargs
         if not isinstance(params, dict):
             raise ValueError(f"tool_params 必须为 dict，收到: {type(params).__name__}")
@@ -559,7 +640,7 @@ class ShoppingGuideAgent:
                 raw = mcp.call(tool_name, **params)
                 result = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(result, dict) and "error" in result:
-                    continue  # 不是该组的工具或不存在 → 试下一个
+                    continue
                 return result
             except Exception:
                 continue
@@ -567,54 +648,24 @@ class ShoppingGuideAgent:
         print(f"[exec_tool] {tool_name} 所有 MCP 客户端均不可用", flush=True)
         return None
 
-
-
     def _reset(self) -> None:
-        """重置内部状态"""
         self._all_dialogues = []
         self._previous_analyses = []
-        self._recommended_products = []
-        self._product_followups = []
-        self._last_category = ""
-        self._skill_loaded = False
-        self._loaded_skill_context = ""
-        self._products_loaded = False
-        self._l1_count = 0
-
-    def remember(self, content: str, mem_type: str = "knowledge", importance: float = 0.5):
-        """手动添加一条短期记忆"""
-        node = MemoryNode.create(
-            type=mem_type,
-            source="user",
-            content=content,
-            importance=importance,
-        )
-        self._short_memory.add(node)
-
-    def recall_short(self, query: str = "", limit: int = 10) -> list[MemoryNode]:
-        """读取短期记忆"""
-        memories = self._short_memory.read()
-        if query:
-            # 简单关键词过滤
-            q = query.lower()
-            memories = [m for m in memories if q in m.content.lower()]
-        return memories[:limit]
+        self._tool_call_content = []
+        self._product_prompt = None
 
     def _format_dialogues(self, dialogues: list[dict]) -> str:
-        """格式化对话列表为文本"""
         lines = []
-        for d in dialogues:
-            role = d.get("role", "unknown")
-            content = d.get("content", "")
+        for dialogue in dialogues:
+            role = dialogue.get("role", "unknown")
+            content = dialogue.get("content", "")
             lines.append(f"[{role}]: {content}")
         return "\n".join(lines)
 
     def _load_prompt(self, key: str) -> str:
-        """加载 prompt 模板"""
         path = self._prompts.get(key, "")
         if not path or not os.path.exists(path):
             if key == "guide_system":
                 return "你是导购助手，请用中文分析用户购买需求。"
             raise FileNotFoundError(f"Prompt 文件不存在: key={key}, path={path}")
         return load_text_file(path, strict=True)
-

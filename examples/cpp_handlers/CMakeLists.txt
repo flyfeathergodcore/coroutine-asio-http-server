@@ -55,3 +55,23 @@ target_link_libraries(example_handlers PUBLIC
 set_target_properties(example_handlers PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
+
+# ── registerhandler .so 插件（登录/注册/验证 API） ──
+add_library(registerhandler SHARED
+    registerhandler.cpp
+    ${PROTO_GEN_SRCS}
+)
+
+target_include_directories(registerhandler PUBLIC
+    ${PROTO_GEN_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
+)
+
+target_link_libraries(registerhandler PUBLIC
+    grpc++ grpc protobuf
+)
+
+set_target_properties(registerhandler PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/handlers"
+)

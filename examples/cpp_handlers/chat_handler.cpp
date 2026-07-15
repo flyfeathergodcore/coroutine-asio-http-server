@@ -86,6 +86,11 @@ asio::awaitable<void> ChatHandler::HandleStream(
     std::vector<std::string> tokens;
     std::string grpc_error;
 
+    // ── 日志：gRPC 请求 ──
+    std::cerr << "[grpc] → ai-chat:50051  ChatStream  user=" << user
+              << "  msg_len=" << message.size() << "  model=" << model << std::endl;
+    auto grpc_t0 = std::chrono::steady_clock::now();
+
     {
         grpc::ClientContext context;
         auto rw = stub->ChatStream(&context);
@@ -111,6 +116,15 @@ asio::awaitable<void> ChatHandler::HandleStream(
             }
         }
         rw->Finish();
+    }
+
+    auto grpc_t1 = std::chrono::steady_clock::now();
+    auto grpc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(grpc_t1 - grpc_t0).count();
+    if (!grpc_error.empty()) {
+        std::cerr << "[grpc] ← ERROR  " << grpc_ms << "ms  " << grpc_error << std::endl;
+    } else {
+        std::cerr << "[grpc] ← OK  " << grpc_ms << "ms  " << tokens.size() << " tokens"
+                  << "  first_token=\"" << (tokens.empty() ? "" : tokens[0].substr(0,40)) << "\"" << std::endl;
     }
 
     if (!grpc_error.empty()) {
