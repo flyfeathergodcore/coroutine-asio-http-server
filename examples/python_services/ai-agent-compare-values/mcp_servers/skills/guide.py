@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 import logging
 from mcp.server.fastmcp import FastMCP
-from depend.db import load_config, get_conn
+from depend.db import get_conn
 from depend.get_time import get_now_datetime_str
 from depend.auth import require_role
 import mysql.connector as connector
