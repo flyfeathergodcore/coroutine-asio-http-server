@@ -44,18 +44,19 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 
 
 def load_config(path: Optional[str] = None) -> dict:
-    """
-    加载 YAML 配置文件。
+    """加载 YAML 配置文件（仅非环境配置，环境配置请使用 .env + os.getenv）
 
     Args:
-        path: 配置文件路径，默认项目根目录下的 config.yaml
+        path: 配置文件路径，默认优先使用 CONFIG_PATH 环境变量，否则项目根目录下的 config.yaml
 
     Returns:
         dict: 解析后的配置字典
     """
     if path is None:
-        path = os.path.join(_project_root, "config.yaml")
-    with open(path, 'r', encoding='utf-8') as f:
+        cfg_path = os.getenv("CONFIG_PATH", os.path.join(_project_root, "config.yaml"))
+    else:
+        cfg_path = path
+    with open(cfg_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 
@@ -66,17 +67,15 @@ def _ensure_pool(path: Optional[str] = None) -> MySQLConnectionPool:
         with _POOL_LOCK:
             # 双重检查
             if _POOL is None:
-                config = load_config(path)
-                db = config["database"]["mysql"]
                 _POOL = MySQLConnectionPool(
-                    pool_name=db.get("pool_name", _POOL_NAME),
-                    pool_size=db.get("pool_size", _POOL_SIZE),
+                    pool_name=_POOL_NAME,
+                    pool_size=_POOL_SIZE,
                     pool_reset_session=True,
-                    host=db["host"],
-                    port=db["port"],
-                    user=db["user"],
-                    password=db["password"],
-                    database=db["database"],
+                    host=os.getenv("MYSQL_HOST", "localhost"),
+                    port=int(os.getenv("MYSQL_PORT", "3306")),
+                    user=os.getenv("MYSQL_USER", "webcpp"),
+                    password=os.getenv("MYSQL_PASSWORD", "webcpp123"),
+                    database=os.getenv("MYSQL_DATABASE", "webcpp"),
                 )
     return _POOL
 
