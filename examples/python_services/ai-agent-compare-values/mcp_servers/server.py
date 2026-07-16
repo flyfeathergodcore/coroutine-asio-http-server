@@ -188,12 +188,12 @@ def init_agents(config: dict[str, Any] | None = None):
     from core.product_agent import ProductAgent
 
     cfg = config or load_config()
+    llm_api_key = os.getenv("LLM_API_KEY") or cfg.get("llm", {}).get("api_key", "ollama")
+    llm_base_url = os.getenv("LLM_BASE_URL") or cfg.get("llm", {}).get("base_url", "http://localhost:11434/v1")
+    llm_model = os.getenv("LLM_MODEL") or cfg.get("llm", {}).get("model", "llama3:8b")
     llm_cfg = cfg.get("llm", {})
-    # 环境变量覆盖 config.yaml，方便 Docker 部署时切换地址
-    llm_base_url = os.environ.get("LLM_BASE_URL") or llm_cfg.get("base_url", "http://localhost:11434/v1")
-    llm_model = os.environ.get("LLM_MODEL") or llm_cfg.get("model", "llama3:8b")
     llm = LLMClient(
-        api_key=llm_cfg.get("api_key", "ollama"),
+        api_key=llm_api_key,
         base_url=llm_base_url,
         model=llm_model,
         timeout=llm_cfg.get("timeout", 60),
@@ -202,8 +202,7 @@ def init_agents(config: dict[str, Any] | None = None):
     )
 
     # ── 启动 MCP SSE 服务端（后台线程）──
-    mcp_cfg = cfg.get("mcp", {})
-    mcp_port = mcp_cfg.get("port", 8765)
+    mcp_port = int(os.getenv("MCP_PORT") or cfg.get("mcp", {}).get("port", 8765))
     _mcp_server = MCPServer(port=mcp_port, host="0.0.0.0")
     _t = threading.Thread(target=_mcp_server.start, daemon=True)
     _t.start()
